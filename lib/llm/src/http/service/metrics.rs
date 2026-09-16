@@ -63,13 +63,23 @@ pub fn request_was_unavailable(err: &(dyn std::error::Error + 'static)) -> bool 
 
 /// Check whether an error chain indicates the request was cancelled.
 pub fn request_was_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
-    const CANCELLATION: &[DynamoErrorType] = &[DynamoErrorType::Cancelled];
+    const CANCELLATION: &[DynamoErrorType] = &[
+        DynamoErrorType::Cancelled,
+        DynamoErrorType::Backend(dynamo_runtime::error::BackendError::Cancelled),
+    ];
     const NON_CANCELLATION: &[DynamoErrorType] = &[];
     dynamo_runtime::error::match_error_chain(err, CANCELLATION, NON_CANCELLATION)
 }
 
 pub fn request_was_timed_out(err: &(dyn std::error::Error + 'static)) -> bool {
-    const TIMEOUT: &[DynamoErrorType] = &[DynamoErrorType::ResponseTimeout];
+    use dynamo_runtime::error::BackendError;
+
+    const TIMEOUT: &[DynamoErrorType] = &[
+        DynamoErrorType::ResponseTimeout,
+        DynamoErrorType::ConnectionTimeout,
+        DynamoErrorType::Backend(BackendError::ResponseTimeout),
+        DynamoErrorType::Backend(BackendError::ConnectionTimeout),
+    ];
     const NON_TIMEOUT: &[DynamoErrorType] = &[];
     dynamo_runtime::error::match_error_chain(err, TIMEOUT, NON_TIMEOUT)
 }
