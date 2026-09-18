@@ -96,18 +96,7 @@ NIXL prefill/decode also requires the gRPC numeric-conversion fix in
 
 ### Native Generate compatibility
 
-`vllm-proto 0.1.0` does not include the native sampling JSON extension proposed
-in [vLLM #56421](https://github.com/vllm-project/vllm/pull/56421). The sidecar
-therefore does not advertise `vllm_inference_v1_generate`. Aggregated and decode
-requests from v1.4 frontends can still use the legacy
-`extra_args.vllm_tito.sampling_params` envelope for controls already preserved
-in the typed request: `max_tokens`, `min_tokens`, `ignore_eos`, `logprobs`,
-`prompt_logprobs`, and `skip_special_tokens`. Other sampling settings fail
-with an explicit unsupported-request error.
-Use the chat/completions APIs with the supported typed controls instead.
-Prefill and encode still use their canonical one-token request; they do not
-apply decode sampling JSON. Native Generate can be enabled after an upstream
-protocol release includes both the payload and its capability flag.
+`vllm-proto 0.3.0` carries the sampling, stopping, response, multimodal, and LoRA controls projected by Dynamo's native Generate frontend. The sidecar therefore advertises `vllm_inference_v1_generate`. The legacy `extra_args.vllm_tito.sampling_params` envelope remains during rolling upgrades, but only fields also represented in the typed request are accepted. Other sampling settings fail with an explicit unsupported-request error instead of being silently discarded. Prefill and encode use their canonical one-token request and do not apply decode sampling JSON.
 
 ### Runtime compatibility
 
