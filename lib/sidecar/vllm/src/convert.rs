@@ -77,7 +77,13 @@ pub(crate) fn build_generate_request(
     if !mode.is_prefill()
         && !mode.is_encode()
         && let Some(sampling) = vllm_tito_sampling(&request.extra_args)?
-        && let Some(key) = sampling.keys().find(|key| {
+    {
+        if legacy_bool(sampling, "return_token_ids")? == Some(false) {
+            return Err(client::invalid_argument(
+                "extra_args.vllm_tito.sampling_params.return_token_ids must be true for vLLM gRPC",
+            ));
+        }
+        if let Some(key) = sampling.keys().find(|key| {
             !matches!(
                 key.as_str(),
                 "temperature"
@@ -95,12 +101,13 @@ pub(crate) fn build_generate_request(
                     | "logprobs"
                     | "prompt_logprobs"
                     | "skip_special_tokens"
+                    | "return_token_ids"
             )
-        })
-    {
-        return Err(client::invalid_argument(format!(
-            "extra_args.vllm_tito.sampling_params.{key} is not supported by vllm-proto 0.3.0; use the chat/completions API"
-        )));
+        }) {
+            return Err(client::invalid_argument(format!(
+                "extra_args.vllm_tito.sampling_params.{key} is not supported by vllm-proto 0.3.0; use the chat/completions API"
+            )));
+        }
     }
 
     let has_raw_media = request_has_raw_media(&request);
