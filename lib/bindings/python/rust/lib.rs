@@ -416,6 +416,14 @@ pub(crate) fn worker_selection_policy_factory(
 ) -> anyhow::Result<Option<WorkerSelectionPolicyFactory>> {
     #[cfg(feature = "custom-policy")]
     {
+        // Only explicitly selected policies require the custom HTTP/KV frontend path.
+        // Embedded routers resolve the builtin default through the installed registry.
+        if config
+            .selected_worker_selection_policy_instance()?
+            .is_none()
+        {
+            return Ok(None);
+        }
         Ok(WORKER_SELECTION_POLICY_REGISTRY
             .get()
             .map(|registry| registry.resolve(config))
@@ -432,6 +440,16 @@ pub(crate) fn worker_selection_policy_factory(
         }
         Ok(None)
     }
+}
+
+#[cfg(all(test, feature = "custom-policy"))]
+#[test]
+fn builtin_default_does_not_require_custom_frontend() {
+    let config = KvRouterConfig::default();
+    let registry = WORKER_SELECTION_POLICY_REGISTRY
+        .get_or_init(dynamo_custom_policy_builtin::default_registry);
+    assert!(registry.resolve(&config).unwrap().is_some());
+    assert!(worker_selection_policy_factory(&config).unwrap().is_none());
 }
 
 #[cfg(feature = "select-service")]
