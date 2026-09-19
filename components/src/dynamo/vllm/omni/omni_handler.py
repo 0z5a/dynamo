@@ -6,24 +6,14 @@ import functools
 import logging
 import os
 import random
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import (
     Any,
-    AsyncGenerator,
-    AsyncIterator,
-    Callable,
-    Dict,
-    Optional,
-    Union,
     cast,
 )
 
 import PIL.Image
-from fsspec.implementations.dirfs import DirFileSystem
-from vllm.lora.request import LoRARequest
-from vllm.sampling_params import SamplingParams
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-
 from dynamo._core import Context
 from dynamo.common.multimodal import ImageLoader
 from dynamo.common.protocols import sanitize_media_passthrough
@@ -56,11 +46,8 @@ from dynamo.vllm.omni.base_handler import BaseOmniHandler
 # Re-exported: EngineInputs moved to its own module so the per-modality
 # builders can annotate it without importing this handler.
 from dynamo.vllm.omni.engine_inputs import EngineInputs
-from dynamo.vllm.omni.output_formatter import (
-    AudioAggregateState,
-    AudioStreamState,
-    OutputFormatter,
-)
+from dynamo.vllm.omni.format_contract import FormatSession, serialize_outcome
+from dynamo.vllm.omni.output_formatter import OutputFormatter
 from dynamo.vllm.omni.utils import (
     audio_output_is_cumulative,
     build_image_generation_prompt,
@@ -70,6 +57,11 @@ from dynamo.vllm.omni.utils import (
     image_generation_size_from_str,
     streaming_sampling_params,
 )
+from fsspec.implementations.dirfs import DirFileSystem
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+
+from vllm.lora.request import LoRARequest
+from vllm.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +69,7 @@ DEFAULT_VIDEO_FPS = 16
 
 
 def _apply_media_passthrough(
-    sp: OmniDiffusionSamplingParams, extra_args: Optional[Dict[str, Any]]
+    sp: OmniDiffusionSamplingParams, extra_args: dict[str, Any] | None
 ) -> None:
     """Hand frontend-forwarded passthrough knobs to the engine.
 
@@ -183,8 +175,8 @@ class OmniHandler(BaseOmniHandler):
     @staticmethod
     def _lora_error_payload(
         lora_name: str, message: str, **extra: Any
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "status": "error",
             "message": message,
             "lora_name": lora_name,
@@ -196,10 +188,10 @@ class OmniHandler(BaseOmniHandler):
         self,
         runtime,
         config,
-        default_sampling_params: Dict[str, Any],
+        default_sampling_params: dict[str, Any],
         shutdown_event: asyncio.Event | None = None,
-        media_output_fs: Optional[DirFileSystem] = None,
-        media_output_http_url: Optional[str] = None,
+        media_output_fs: DirFileSystem | None = None,
+        media_output_http_url: str | None = None,
         generate_endpoint=None,
     ):
         """Initialize the unified Omni handler.
@@ -304,8 +296,8 @@ class OmniHandler(BaseOmniHandler):
         )
 
     async def generate(
-        self, request: Dict[str, Any], context: Context
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+        self, request: dict[str, Any], context: Context
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """Generate outputs via the unified OpenAI mode.
 
         Args:
@@ -323,15 +315,15 @@ class OmniHandler(BaseOmniHandler):
             yield chunk
 
     async def _generate_openai_mode(
-        self, request: Dict[str, Any], context: Context, request_id: str
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+        self, request: dict[str, Any], context: Context, request_id: str
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """Single generation path for all request protocols and output modalities."""
 
         parsed_request_raw, request_type = parse_request_type(
             request, self.config.output_modalities
         )
         parsed_request = cast(
-            Union[NvCreateImageRequest, NvCreateVideoRequest, Dict[str, Any]],
+            NvCreateImageRequest | NvCreateVideoRequest | dict[str, Any],
             parsed_request_raw,
         )
 
@@ -361,6 +353,15 @@ class OmniHandler(BaseOmniHandler):
             inputs = await self.build_engine_inputs(
                 parsed_request, request_type, image=image, request_id=request_id
             )
+            # Validated here, with the request, so an unusable option set fails
+            # before the engine starts and before any encoder runs.
+            format_context = self.output_formatter.engine_context(
+                inputs.request_type,
+                response_format=inputs.response_format,
+                output_format=inputs.output_format,
+                fps=inputs.fps,
+                speed=inputs.speed,
+            )
         except (ValueError, NotImplementedError, RuntimeError) as e:
             logger.error(f"Invalid request {request_id}: {e}")
             if isinstance(e, ValueError) and request_type in (
@@ -375,7 +376,7 @@ class OmniHandler(BaseOmniHandler):
             yield self._error_chunk(request_id, str(e), request_type)
             return
 
-        generate_kwargs: Dict[str, Any] = {
+        generate_kwargs: dict[str, Any] = {
             "prompt": inputs.prompt,
             "request_id": request_id,
         }
@@ -392,35 +393,22 @@ class OmniHandler(BaseOmniHandler):
         if inputs.lora_request is not None and inputs.sampling_params_list is None:
             generate_kwargs["lora_request"] = inputs.lora_request
 
-        previous_text = ""
-        audio_stream_state = AudioStreamState() if inputs.stream_audio else None
+        # All per-request formatting state -- previous text, the audio buffers,
+        # and the finish latch -- lives on this session, never on the formatter.
         # Read the coerced params, not the request's: the coercion above is what
         # decides whether the engine emits disjoint deltas or whole-waveform
         # snapshots, so aggregation has to follow its result rather than the
         # model's identity.
-        audio_aggregate_state = (
-            AudioAggregateState(
-                cumulative=audio_output_is_cumulative(inputs.sampling_params_list)
-            )
-            if inputs.request_type == RequestType.AUDIO_GENERATION
-            and not inputs.stream_audio
-            else None
+        session = FormatSession.for_request(
+            request_id,
+            inputs.request_type,
+            stream_audio=inputs.stream_audio,
+            cumulative_audio=audio_output_is_cumulative(inputs.sampling_params_list),
         )
-
-        def update_previous_text(stage_output: Any, current: str) -> str:
-            if getattr(stage_output, "final_output_type", None) == "text" and getattr(
-                stage_output, "request_output", None
-            ):
-                outputs = stage_output.request_output.outputs
-                if outputs:
-                    return outputs[0].text
-            return current
 
         async def create_generator(
             admitted_lora_request: LoRARequest | None,
-        ) -> AsyncIterator[Dict[str, Any]]:
-            nonlocal previous_text
-
+        ) -> AsyncIterator[dict[str, Any]]:
             per_request_kwargs = dict(generate_kwargs)
             # Critical: Apply the re-resolved adapter under the admission lock.
             # This ensures that if a hot-swap occurred between build time and lock
@@ -439,41 +427,40 @@ class OmniHandler(BaseOmniHandler):
                     # LLM path: set top-level lora_request for text generation
                     per_request_kwargs["lora_request"] = admitted_lora_request
 
-            async for stage_output in self.engine_client.generate(**per_request_kwargs):
-                chunk = await self.output_formatter.format(
-                    stage_output,
-                    request_id,
-                    request_type=inputs.request_type,
-                    fps=inputs.fps,
-                    response_format=inputs.response_format,
-                    output_format=inputs.output_format,
-                    previous_text=previous_text,
-                    speed=inputs.speed,
-                    audio_stream_state=audio_stream_state,
-                    audio_aggregate_state=audio_aggregate_state,
-                )
-                previous_text = update_previous_text(stage_output, previous_text)
-                yield {"stage_output": stage_output, "formatted_chunk": chunk}
+            completed = False
+            try:
+                async for stage_output in self.engine_client.generate(
+                    **per_request_kwargs
+                ):
+                    outcome = await self.output_formatter.format(
+                        format_context, stage_output, session
+                    )
+                    payload = serialize_outcome(outcome)
+                    if payload is not None:
+                        yield payload
 
-            if audio_aggregate_state is not None:
-                chunk = await self.output_formatter.finish_audio(
-                    request_id,
-                    audio_aggregate_state,
-                    response_format=inputs.response_format,
-                    output_format=inputs.output_format,
-                    speed=inputs.speed,
+                # The request end is where a buffered response becomes visible
+                # and where "produced nothing at all" stops being a gap.
+                payload = serialize_outcome(
+                    await self.output_formatter.finish(format_context, session)
                 )
-                yield {"stage_output": None, "formatted_chunk": chunk}
+                if payload is not None:
+                    yield payload
+                completed = True
+            finally:
+                if not completed:
+                    # Cancellation or a generation error: nothing final is
+                    # emitted and the request's buffers are released.
+                    session.abort()
 
         async with self._abort_monitor(context, request_id):
             try:
-                async for chunk in self._generate_with_lora_admission_lock(
+                async for payload in self._generate_with_lora_admission_lock(
                     inputs.lora_request,
                     create_generator,
                     sampling_params_list=inputs.sampling_params_list,
                 ):
-                    if chunk and chunk.get("formatted_chunk"):
-                        yield chunk["formatted_chunk"]
+                    yield payload
 
             except EngineShutdown:
                 logger.info(f"Request {request_id} aborted due to shutdown")
@@ -583,12 +570,10 @@ class OmniHandler(BaseOmniHandler):
 
     async def build_engine_inputs(
         self,
-        parsed_request: Union[
-            NvCreateImageRequest,
-            NvCreateVideoRequest,
-            NvCreateAudioSpeechRequest,
-            Dict[str, Any],
-        ],
+        parsed_request: NvCreateImageRequest
+        | NvCreateVideoRequest
+        | NvCreateAudioSpeechRequest
+        | dict[str, Any],
         request_type: RequestType,
         image: PIL.Image.Image | None = None,
         request_id: str | None = None,
@@ -623,7 +608,7 @@ class OmniHandler(BaseOmniHandler):
 
         raise ValueError(f"Unknown request type: {request_type}")
 
-    def _engine_inputs_from_chat(self, request: Dict[str, Any]) -> EngineInputs:
+    def _engine_inputs_from_chat(self, request: dict[str, Any]) -> EngineInputs:
         """Build engine inputs from a chat completions request dict."""
 
         text_prompt = self._extract_text_prompt(request)
@@ -803,9 +788,7 @@ class OmniHandler(BaseOmniHandler):
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        sp.seed = (
-            nvext.seed if nvext.seed is not None else random.randint(0, 2**32 - 1)
-        )
+        sp.seed = nvext.seed if nvext.seed is not None else random.randint(0, 2**32 - 1)
         _apply_media_passthrough(sp, req.extra_args)
 
         sampling_params_list = self._build_sampling_params_list(sp)

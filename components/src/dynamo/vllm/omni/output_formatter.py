@@ -3,41 +3,45 @@
 
 """Convert vLLM-Omni stage outputs into Dynamo protocol responses.
 
-``OutputFormatter`` is the caller entry point. Construct it once for a model and
-pass each engine stage to ``await format(...)``. It dispatches on
-``stage_output.final_output_type`` using this stage contract:
+``OutputFormatter`` is the caller entry point. Construct it once for a model,
+open one ``FormatSession`` per request, and hand every stage to
+``await format(context, stage_output, session)`` and then
+``await finish(context, session)``. The aggregated ``OmniHandler`` and the
+disaggregated ``OmniStageRouter`` use exactly that sequence; the questions it
+answers live in ``format_contract``:
 
-* ``"text"`` reads ``request_output`` and the optional ``previous_text`` context.
-* ``"image"`` or ``"video"`` reads ``images``. Supply ``request_type`` to
-  distinguish image, video, and chat-completion responses because a video
-  diffusion stage may be labelled ``"image"``.
-* ``"audio"`` reads ``multimodal_output``. Video stages may also use that mapping
-  for video, audio, frame-rate, and sample-rate data.
+* what the request asked for -- ``FormatContext``, validated before any encode;
+* which modality this stage is -- ``resolve_dispatch``, the only place that
+  reads ``final_output_type`` against request intent;
+* what the request has accumulated -- ``FormatSession``, one per request;
+* whether this step emitted, legally emitted nothing, or failed --
+  ``FormattingOutcome``.
 
-A typical one-stage call is::
+A typical request is::
 
-    formatter = OutputFormatter(model_name, media_fs, media_http_url)
-    response = await formatter.format(
-        stage_output,
-        request_id,
-        request_type=request_type,
-        response_format="b64_json",
-    )
+    context = formatter.engine_context(inputs.request_type, fps=inputs.fps)
+    session = FormatSession.for_request(request_id, inputs.request_type)
+    async for stage_output in engine.generate(...):
+        payload = serialize_outcome(
+            await formatter.format(context, stage_output, session)
+        )
+        if payload is not None:
+            yield payload
+    payload = serialize_outcome(await formatter.finish(context, session))
 
-The common context keys are ``response_format``, ``output_format``, ``fps``,
-``speed``, and the audio state objects. URL responses require a writable
-``media_fs``; ``media_http_url`` optionally rewrites the returned public URL.
+The modality formatters below own the codecs and the storage calls. Their
+``run()`` methods take a resolved dispatch and return an outcome; their
+``format()`` methods keep returning the serialized payload for direct callers.
 
-Audio state belongs to one request. For streaming, pass the same
-``AudioStreamState`` to every stage as ``audio_stream_state``. For one final
-non-streaming response, pass one ``AudioAggregateState`` as
-``audio_aggregate_state`` to every stage, then call ``await finish_audio(...)``
-with that state after the engine finishes.
+URL responses require a writable ``media_fs``; ``media_http_url`` optionally
+rewrites the returned public URL. A context that asks for a URL while the
+worker has no media filesystem is rejected where the context is built, so the
+request fails before any frame is encoded.
 
-Formatters return serialized response mappings, or ``None`` when a stage has no
-response to emit. Invalid request options may raise ``ValueError``;
-media-processing failures are normally represented by a modality response with
-``status="failed"``.
+Audio state belongs to the request: an audio request that streams encodes each
+chunk as it arrives through ``session.audio_stream_state``, and one that does
+not buffers into ``session.audio_aggregate_state`` and encodes once in
+``finish()``. The formatter itself keeps no request state.
 
 The formatters are independent of engine construction and model loading, so
 aggregated handlers, disaggregated routers, and tests can share them.
@@ -50,9 +54,8 @@ import struct
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -75,6 +78,22 @@ from dynamo.common.utils.video_utils import (
     normalize_video_frames,
 )
 from dynamo.vllm.handlers import build_prompt_tokens_details
+from dynamo.vllm.omni.format_contract import (
+    AudioAggregateState,
+    AudioStreamState,
+    Emitted,
+    Failed,
+    FormatContext,
+    FormatSession,
+    FormattingOutcome,
+    Modality,
+    NoEmission,
+    NoEmissionReason,
+    ResponseSchema,
+    StageDispatch,
+    resolve_dispatch,
+    serialize_outcome,
+)
 from dynamo.vllm.omni.utils import is_empty_payload
 
 logger = logging.getLogger(__name__)
@@ -82,35 +101,42 @@ logger = logging.getLogger(__name__)
 DEFAULT_AUDIO_SAMPLE_RATE = 24000
 
 
-@dataclass
-class AudioStreamState:
-    """Request-local state for incremental audio output."""
+def _failure_payload(
+    modality: Modality, request_id: str, model_name: str, error: str
+) -> dict[str, Any]:
+    """Build the body a modality already uses to report a failed serialization.
 
-    emitted_chunks: int = 0
-    sample_rate: int | None = None
-    num_channels: int | None = None
-    channel_axis: int | None = None
+    Args:
+        modality: Modality whose response shape the body must take.
+        request_id: Identifier included in the response.
+        model_name: Model identifier included in the response.
+        error: User-facing error description.
 
-
-@dataclass
-class AudioAggregateState:
-    """Request-local raw audio accumulated for one final encode."""
-
-    chunks: list[np.ndarray] = field(default_factory=list)
-    sample_rate: int | None = None
-    emitted_chunks: int = 0
-    num_channels: int | None = None
-    channel_axis: int | None = None
-    cumulative: bool = False
-    """Each payload is a snapshot of the whole waveform decoded so far.
-
-    Set from the output kind the engine was actually given, not from the model:
-    ``RequestOutputKind.CUMULATIVE`` consolidates the accumulated audio on every
-    step and drains nothing, so the snapshots must be de-duplicated to the
-    longest one rather than concatenated, while ``DELTA`` drains what it emits
-    and yields disjoint pieces that must all be kept. See
-    ``utils.audio_output_is_cumulative``, which the handler uses to fill this in.
+    Returns:
+        Dict[str, Any]: Serialized failure body for that modality.
     """
+    if modality is Modality.VIDEO:
+        return NvVideosResponse(
+            id=request_id,
+            object="video",
+            model=model_name,
+            status="failed",
+            progress=0,
+            created=int(time.time()),
+            data=[],
+            error=error,
+        ).model_dump()
+    if modality is Modality.AUDIO:
+        return NvAudioSpeechResponse(
+            id=request_id,
+            model=model_name,
+            status="failed",
+            created=int(time.time()),
+            error=error,
+        ).model_dump()
+    # Text and image responses both report a failed serialization as an error
+    # chunk; an image endpoint has no failure field of its own.
+    return _error_chunk(request_id, model_name, error)
 
 
 class TextFormatter:
@@ -127,13 +153,13 @@ class TextFormatter:
         """
         self._model_name = model_name
 
-    def format(
+    def run(
         self,
         request_output: Any,
         request_id: str,
         *,
         previous_text: str = "",
-    ) -> Dict[str, Any] | None:
+    ) -> FormattingOutcome:
         """Format the next text delta as a chat-completion chunk.
 
         Args:
@@ -142,18 +168,23 @@ class TextFormatter:
             previous_text: Text already emitted for this request.
 
         Returns:
-            Dict[str, Any] | None: Formatted chunk or an engine-output error chunk.
+            FormattingOutcome: ``Emitted`` with the chunk, or ``Failed`` when
+                the engine produced no choice to read.
 
         Raises:
             AttributeError: If the request output lacks required choice fields.
         """
         if not request_output.outputs:
-            return _error_chunk(request_id, self._model_name, "No outputs from engine")
+            error = "No outputs from engine"
+            return Failed(
+                error=error,
+                compatible_payload=_error_chunk(request_id, self._model_name, error),
+            )
 
         output = request_output.outputs[0]
         delta_text = output.text[len(previous_text) :]
 
-        chunk: Dict[str, Any] = {
+        chunk: dict[str, Any] = {
             "id": request_id,
             "created": int(time.time()),
             "object": "chat.completion.chunk",
@@ -174,21 +205,43 @@ class TextFormatter:
         if output.finish_reason:
             chunk["usage"] = _build_completion_usage(request_output)
 
-        return chunk
+        return Emitted(chunk)
+
+    def format(
+        self,
+        request_output: Any,
+        request_id: str,
+        *,
+        previous_text: str = "",
+    ) -> dict[str, Any] | None:
+        """Serialize the next text delta; ``run`` is the typed contract.
+
+        Args:
+            request_output: vLLM request output containing generated choices.
+            request_id: Identifier included in the response chunk.
+            previous_text: Text already emitted for this request.
+
+        Returns:
+            Dict[str, Any] | None: Formatted chunk or an engine-output error chunk.
+        """
+        return serialize_outcome(
+            self.run(request_output, request_id, previous_text=previous_text)
+        )
 
 
 class DiffusionFormatter:
     """Formats diffusion output (images/video frames) for the frontend.
 
-    Handles both image and video — routes by request_type since vllm-omni
-    reports final_output_type="image" for all diffusion outputs.
+    Handles both image and video output. The modality is decided once, by
+    ``format_contract.resolve_dispatch``, because vLLM-Omni reports
+    final_output_type="image" for all diffusion outputs including video frames.
     """
 
     def __init__(
         self,
         model_name: str,
         media_fs: Any,
-        media_http_url: Optional[str],
+        media_http_url: str | None,
         default_fps: int = 16,
     ) -> None:
         """Initialize a diffusion formatter.
@@ -207,19 +260,29 @@ class DiffusionFormatter:
         self._media_http_url = media_http_url
         self._default_fps = default_fps
 
-    async def format(
-        self, stage_output: Any, request_id: str, *, request_type: Any, **ctx: Any
-    ) -> Dict[str, Any] | None:
-        """Format a diffusion stage output as an image or video response.
+    async def run(
+        self,
+        stage_output: Any,
+        request_id: str,
+        *,
+        dispatch: StageDispatch,
+        fps: int | None = None,
+        response_format: str | None = None,
+        output_format: str | None = None,
+    ) -> FormattingOutcome:
+        """Format one diffusion stage under its resolved dispatch.
 
         Args:
             stage_output: vLLM-Omni stage output containing generated media.
             request_id: Identifier included in the response.
-            request_type: Request kind used to distinguish image and video output.
-            **ctx: Response format, output format, and frame-rate overrides.
+            dispatch: The modality and response schema resolved for this stage.
+            fps: Frame-rate override; the formatter default applies when unset.
+            response_format: ``"url"`` or ``"b64_json"`` representation.
+            output_format: Video container format; currently only ``"mp4"``.
 
         Returns:
-            Dict[str, Any] | None: Formatted response, or ``None`` for empty images.
+            FormattingOutcome: The emitted response, or an explicit failure
+                carrying that modality's failure body.
 
         Raises:
             ValueError: If an image or video response option is unsupported.
@@ -228,23 +291,97 @@ class DiffusionFormatter:
             stage_output.images if hasattr(stage_output, "images") else stage_output
         )
 
-        if request_type == RequestType.VIDEO_GENERATION:
-            return await self._encode_video(
+        if dispatch.modality is Modality.VIDEO:
+            response = await self._encode_video(
                 images,
                 request_id,
                 multimodal_output=self._extract_multimodal_output(stage_output),
-                fps=ctx.get("fps", self._default_fps),
-                response_format=ctx.get("response_format"),
-                output_format=ctx.get("output_format"),
+                fps=self._default_fps if fps is None else fps,
+                response_format=response_format,
+                output_format=output_format,
             )
+            return self._video_outcome(response, request_id)
+
         if is_empty_payload(images):
-            return None
-        return await self._encode_image(
-            images,
-            request_id,
-            request_type=request_type,
-            response_format=ctx.get("response_format"),
+            error = "No images generated"
+            return Failed(
+                error=error,
+                compatible_payload=_error_chunk(request_id, self._model_name, error),
+            )
+        try:
+            response = await self._encode_image(
+                images,
+                request_id,
+                schema=dispatch.schema,
+                response_format=response_format,
+            )
+        except Exception as e:
+            # Encoding and upload failures are a result of the request, not an
+            # error for one caller to raise while the other reports it.
+            logger.error("Failed to encode image for request %s: %s", request_id, e)
+            return Failed(
+                error=str(e),
+                compatible_payload=_failure_payload(
+                    Modality.IMAGE, request_id, self._model_name, str(e)
+                ),
+            )
+        return Emitted(response)
+
+    async def format(
+        self,
+        stage_output: Any,
+        request_id: str,
+        *,
+        dispatch: StageDispatch,
+        fps: int | None = None,
+        response_format: str | None = None,
+        output_format: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Serialize one diffusion stage; ``run`` is the typed contract.
+
+        Args:
+            stage_output: vLLM-Omni stage output containing generated media.
+            request_id: Identifier included in the response.
+            dispatch: The modality and response schema resolved for this stage.
+            fps: Frame-rate override; the formatter default applies when unset.
+            response_format: ``"url"`` or ``"b64_json"`` representation.
+            output_format: Video container format; currently only ``"mp4"``.
+
+        Returns:
+            Dict[str, Any] | None: Formatted response, or its failure body.
+        """
+        return serialize_outcome(
+            await self.run(
+                stage_output,
+                request_id,
+                dispatch=dispatch,
+                fps=fps,
+                response_format=response_format,
+                output_format=output_format,
+            )
         )
+
+    def _video_outcome(
+        self, response: dict[str, Any] | None, request_id: str
+    ) -> FormattingOutcome:
+        """Read an encoded video response as an outcome.
+
+        ``_encode_video`` keeps returning its serialized model for direct
+        callers, and ``status`` is where it records that the encode failed.
+        """
+        if response is None:
+            error = "No video outputs found in generation result"
+            return Failed(
+                error=error,
+                compatible_payload=_failure_payload(
+                    Modality.VIDEO, request_id, self._model_name, error
+                ),
+            )
+        if response.get("status") == "failed":
+            return Failed(
+                error=str(response.get("error", "")), compatible_payload=response
+            )
+        return Emitted(response)
 
     async def _encode_video(
         self,
@@ -252,9 +389,9 @@ class DiffusionFormatter:
         request_id: str,
         fps: int,
         multimodal_output: dict[str, Any] | None = None,
-        response_format: Optional[str] = None,
-        output_format: Optional[str] = None,
-    ) -> Dict[str, Any] | None:
+        response_format: str | None = None,
+        output_format: str | None = None,
+    ) -> dict[str, Any] | None:
         """Encode generated frames and optional audio as video responses.
 
         Args:
@@ -690,19 +827,19 @@ class DiffusionFormatter:
         images: list,
         request_id: str,
         *,
-        request_type: Any,
-        response_format: Optional[str] = None,
-    ) -> Dict[str, Any] | None:
-        """Encode generated images for chat or image-generation responses.
+        schema: ResponseSchema,
+        response_format: str | None = None,
+    ) -> dict[str, Any]:
+        """Encode generated images for a chat or media response.
 
         Args:
             images: Generated image objects to encode.
             request_id: Identifier included in the response and storage path.
-            request_type: Request kind selecting the response schema.
+            schema: Response shape resolved for this dispatch.
             response_format: ``"url"`` or ``"b64_json"`` output representation.
 
         Returns:
-            Dict[str, Any] | None: Formatted response or ``None`` for other request kinds.
+            Dict[str, Any]: Formatted response.
 
         Raises:
             ValueError: If the response format is unsupported.
@@ -713,7 +850,7 @@ class DiffusionFormatter:
 
         data_urls = await self._prepare_images(images, request_id, response_format)
 
-        if request_type == RequestType.CHAT_COMPLETION:
+        if schema is ResponseSchema.CHAT_CHUNK:
             return {
                 "id": request_id,
                 "created": int(time.time()),
@@ -734,28 +871,25 @@ class DiffusionFormatter:
                 ],
             }
 
-        if request_type == RequestType.IMAGE_GENERATION:
-            image_data_list = []
-            for data_url in data_urls:
-                if response_format == "url":
-                    image_data_list.append(ImageData(url=data_url))
-                elif response_format == "b64_json" or response_format is None:
-                    b64 = (
-                        data_url.split(",", 1)[1]
-                        if data_url.startswith("data:")
-                        else data_url
-                    )
-                    image_data_list.append(ImageData(b64_json=b64))
-                else:
-                    raise ValueError(f"Invalid response format: {response_format}")
-            return NvImagesResponse(
-                created=int(time.time()), data=image_data_list
-            ).model_dump()
-
-        return None
+        image_data_list = []
+        for data_url in data_urls:
+            if response_format == "url":
+                image_data_list.append(ImageData(url=data_url))
+            elif response_format == "b64_json" or response_format is None:
+                b64 = (
+                    data_url.split(",", 1)[1]
+                    if data_url.startswith("data:")
+                    else data_url
+                )
+                image_data_list.append(ImageData(b64_json=b64))
+            else:
+                raise ValueError(f"Invalid response format: {response_format}")
+        return NvImagesResponse(
+            created=int(time.time()), data=image_data_list
+        ).model_dump()
 
     async def _prepare_images(
-        self, images: list, request_id: str, response_format: Optional[str] = None
+        self, images: list, request_id: str, response_format: str | None = None
     ) -> list:
         """Serialize images as data URLs or upload-backed URLs.
 
@@ -797,7 +931,7 @@ class AudioFormatter:
     """Formats audio multimodal_output → NvAudioSpeechResponse."""
 
     def __init__(
-        self, model_name: str, media_fs: Any, media_http_url: Optional[str]
+        self, model_name: str, media_fs: Any, media_http_url: str | None
     ) -> None:
         """Initialize an audio formatter.
 
@@ -814,34 +948,42 @@ class AudioFormatter:
         self._media_http_url = media_http_url
         self._AudioData = AudioData  # stored for use in format()
 
-    async def format(
-        self, stage_output: Any, request_id: str, **ctx: Any
-    ) -> Dict[str, Any] | None:
+    async def run(
+        self,
+        stage_output: Any,
+        request_id: str,
+        *,
+        response_format: str | None = None,
+        output_format: str | None = None,
+        speed: float = 1.0,
+        audio_stream_state: AudioStreamState | None = None,
+        audio_aggregate_state: AudioAggregateState | None = None,
+    ) -> FormattingOutcome:
         """Format complete, streaming, or aggregate audio output.
 
         Args:
             stage_output: Stage output or multimodal audio mapping.
             request_id: Identifier included in the response and storage path.
-            **ctx: Encoding, response, speed, and stream-state options.
+            response_format: ``"url"`` or ``"b64_json"`` representation.
+            output_format: Audio codec; WAV when unset.
+            speed: Playback-speed multiplier applied to the whole file.
+            audio_stream_state: Request-local state for incremental output.
+            audio_aggregate_state: Request-local buffer for one final encode.
 
         Returns:
-            Dict[str, Any] | None: Audio response, failure response, or no streaming chunk.
+            FormattingOutcome: ``Emitted`` with the audio response,
+                ``NoEmission`` while the request buffers or has no audio yet,
+                or ``Failed`` with the failed audio body.
         """
-        stream_state = ctx.get("audio_stream_state")
-        aggregate_state = ctx.get("audio_aggregate_state")
         mm_output = (
             stage_output.multimodal_output
             if hasattr(stage_output, "multimodal_output")
             else stage_output
         )
         if is_empty_payload(mm_output):
-            if stream_state is not None or aggregate_state is not None:
-                return None
-            return self._error_response(request_id, "No audio generated")
-
-        response_format = ctx.get("response_format")
-        output_format = ctx.get("output_format")
-        speed = ctx.get("speed", 1.0)
+            if audio_stream_state is not None or audio_aggregate_state is not None:
+                return NoEmission(NoEmissionReason.STREAM_GAP)
+            return self._failed(request_id, "No audio generated")
 
         try:
             start_time = time.time()
@@ -849,10 +991,13 @@ class AudioFormatter:
             # taken whole and de-duplicated in _append_audio_chunk; tracking the
             # newly appended entries would keep only the first snapshot.
             chunk_state: AudioStreamState | AudioAggregateState | None
-            if stream_state is not None:
-                chunk_state = stream_state
-            elif aggregate_state is not None and not aggregate_state.cumulative:
-                chunk_state = aggregate_state
+            if audio_stream_state is not None:
+                chunk_state = audio_stream_state
+            elif (
+                audio_aggregate_state is not None
+                and not audio_aggregate_state.cumulative
+            ):
+                chunk_state = audio_aggregate_state
             else:
                 chunk_state = None
 
@@ -860,20 +1005,20 @@ class AudioFormatter:
                 mm_output, chunk_state=chunk_state
             )
             if audio_np.size == 0:
-                return None
+                return NoEmission(NoEmissionReason.STREAM_GAP)
 
-            if aggregate_state is not None:
-                self._append_audio_chunk(aggregate_state, audio_np, sample_rate)
-                return None
+            if audio_aggregate_state is not None:
+                self._append_audio_chunk(audio_aggregate_state, audio_np, sample_rate)
+                return NoEmission(NoEmissionReason.BUFFERED)
 
             encode_fmt = (output_format or "wav").lower()
-            if stream_state is not None:
+            if audio_stream_state is not None:
                 audio_bytes, _ = await asyncio.to_thread(
                     self._encode_audio_chunk,
                     audio_np,
                     sample_rate,
                     encode_fmt,
-                    stream_state,
+                    audio_stream_state,
                 )
             else:
                 audio_bytes, _ = await asyncio.to_thread(
@@ -904,30 +1049,117 @@ class AudioFormatter:
                     b64_json=base64.b64encode(audio_bytes).decode(),
                 )
 
-            return NvAudioSpeechResponse(
-                id=request_id,
-                object="audio.speech",
-                model=self._model_name,
-                status="completed",
-                progress=100,
-                created=int(time.time()),
-                data=[audio_data_obj],
-                inference_time_s=time.time() - start_time,
-            ).model_dump()
+            return Emitted(
+                NvAudioSpeechResponse(
+                    id=request_id,
+                    object="audio.speech",
+                    model=self._model_name,
+                    status="completed",
+                    progress=100,
+                    created=int(time.time()),
+                    data=[audio_data_obj],
+                    inference_time_s=time.time() - start_time,
+                ).model_dump()
+            )
 
         except Exception as e:
             logger.error("Failed to process audio for request %s: %s", request_id, e)
-            return self._error_response(request_id, str(e))
+            return self._failed(request_id, str(e))
 
-    async def finish_aggregate(
-        self, request_id: str, aggregate_state: AudioAggregateState, **ctx: Any
-    ) -> Dict[str, Any]:
+    async def format(
+        self,
+        stage_output: Any,
+        request_id: str,
+        *,
+        response_format: str | None = None,
+        output_format: str | None = None,
+        speed: float = 1.0,
+        audio_stream_state: AudioStreamState | None = None,
+        audio_aggregate_state: AudioAggregateState | None = None,
+    ) -> dict[str, Any] | None:
+        """Serialize one audio payload; ``run`` is the typed contract.
+
+        Args:
+            stage_output: Stage output or multimodal audio mapping.
+            request_id: Identifier included in the response and storage path.
+            response_format: ``"url"`` or ``"b64_json"`` representation.
+            output_format: Audio codec; WAV when unset.
+            speed: Playback-speed multiplier applied to the whole file.
+            audio_stream_state: Request-local state for incremental output.
+            audio_aggregate_state: Request-local buffer for one final encode.
+
+        Returns:
+            Dict[str, Any] | None: Audio response, failure response, or no streaming chunk.
+        """
+        return serialize_outcome(
+            await self.run(
+                stage_output,
+                request_id,
+                response_format=response_format,
+                output_format=output_format,
+                speed=speed,
+                audio_stream_state=audio_stream_state,
+                audio_aggregate_state=audio_aggregate_state,
+            )
+        )
+
+    async def finalize_aggregate(
+        self,
+        request_id: str,
+        aggregate_state: AudioAggregateState,
+        *,
+        response_format: str | None = None,
+        output_format: str | None = None,
+        speed: float = 1.0,
+    ) -> FormattingOutcome:
         """Encode all buffered raw chunks as one complete audio file.
 
         Args:
             request_id: Identifier included in the response and storage path.
             aggregate_state: Buffered audio chunks and their shared metadata.
-            **ctx: Encoding, response, and speed options.
+            response_format: ``"url"`` or ``"b64_json"`` representation.
+            output_format: Audio codec; WAV when unset.
+            speed: Playback-speed multiplier applied to the whole file.
+
+        Returns:
+            FormattingOutcome: ``Emitted`` with the single audio response, or
+                ``Failed`` when the request buffered nothing emittable.
+
+        Raises:
+            ValueError: If buffered chunks cannot be concatenated.
+        """
+        if not aggregate_state.chunks or aggregate_state.sample_rate is None:
+            return self._failed(request_id, "No audio generated")
+
+        audio_np = np.concatenate(aggregate_state.chunks, axis=-1)
+        outcome = await self.run(
+            {"audio": audio_np, "sr": aggregate_state.sample_rate},
+            request_id,
+            response_format=response_format,
+            output_format=output_format,
+            speed=speed,
+        )
+        if isinstance(outcome, NoEmission):
+            return self._failed(request_id, "No audio generated")
+        return outcome
+
+    async def finish_aggregate(
+        self,
+        request_id: str,
+        aggregate_state: AudioAggregateState,
+        *,
+        response_format: str | None = None,
+        output_format: str | None = None,
+        speed: float = 1.0,
+    ) -> dict[str, Any]:
+        """Serialize the buffered aggregate; ``finalize_aggregate`` is typed.
+
+        Args:
+            request_id: Identifier included in the response and storage path.
+            aggregate_state: Buffered audio chunks and their shared metadata.
+            response_format: ``"url"`` or ``"b64_json"`` representation.
+            output_format: Audio codec; WAV when unset.
+            speed: Playback-speed multiplier applied to the whole file.
 
         Returns:
             Dict[str, Any]: Completed or failed audio response.
@@ -935,18 +1167,22 @@ class AudioFormatter:
         Raises:
             ValueError: If buffered chunks cannot be concatenated.
         """
-        if not aggregate_state.chunks or aggregate_state.sample_rate is None:
-            return self._error_response(request_id, "No audio generated")
-
-        audio_np = np.concatenate(aggregate_state.chunks, axis=-1)
-        response = await self.format(
-            {"audio": audio_np, "sr": aggregate_state.sample_rate},
-            request_id,
-            **ctx,
+        return serialize_outcome(
+            await self.finalize_aggregate(
+                request_id,
+                aggregate_state,
+                response_format=response_format,
+                output_format=output_format,
+                speed=speed,
+            )
         )
-        if response is None:
-            return self._error_response(request_id, "No audio generated")
-        return response
+
+    def _failed(self, request_id: str, error: str) -> Failed:
+        """Build a failure outcome carrying the failed audio response body."""
+        return Failed(
+            error=error,
+            compatible_payload=self._error_response(request_id, error),
+        )
 
     def _append_audio_chunk(
         self,
@@ -1023,7 +1259,7 @@ class AudioFormatter:
 
     def _extract_audio_tensor(
         self,
-        mm_output: Dict[str, Any],
+        mm_output: dict[str, Any],
         *,
         chunk_state: AudioStreamState | AudioAggregateState | None = None,
     ) -> tuple[np.ndarray, int]:
@@ -1074,7 +1310,7 @@ class AudioFormatter:
         return audio_np, self._sample_rate(mm_output)
 
     @staticmethod
-    def _sample_rate(mm_output: Dict[str, Any]) -> int:
+    def _sample_rate(mm_output: dict[str, Any]) -> int:
         """Resolve the latest sample rate from multimodal output.
 
         Args:
@@ -1353,7 +1589,7 @@ class AudioFormatter:
         sf.write(buf, audio_np, sample_rate, format=sf_format, **kwargs)
         return buf.getvalue(), media_type
 
-    def _error_response(self, request_id: str, error: str) -> Dict[str, Any]:
+    def _error_response(self, request_id: str, error: str) -> dict[str, Any]:
         """Build a failed audio-speech response.
 
         Args:
@@ -1374,7 +1610,7 @@ class AudioFormatter:
 
 def _error_chunk(
     request_id: str, model_name: str, error_message: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build an OpenAI chat-completion error chunk.
 
     Args:
@@ -1400,7 +1636,7 @@ def _error_chunk(
     }
 
 
-def _build_completion_usage(request_output: Any) -> Dict[str, Any]:
+def _build_completion_usage(request_output: Any) -> dict[str, Any]:
     """Build token-usage statistics from a vLLM request output.
 
     Args:
@@ -1437,14 +1673,17 @@ def _build_completion_usage(request_output: Any) -> Dict[str, Any]:
 class OutputFormatter:
     """Dispatches raw engine output to modality-specific formatters.
 
-    Shared by OmniHandler (aggregated) and any future disaggregated router.
+    Shared by OmniHandler (aggregated) and OmniStageRouter (disaggregated).
+    Both call ``format()`` once per stage with a per-request
+    ``FormatSession`` and then ``finish()`` once, so neither knows a concrete
+    formatter's parameters and both read the same outcome type.
     """
 
     def __init__(
         self,
         model_name: str,
         media_fs: Any = None,
-        media_http_url: Optional[str] = None,
+        media_http_url: str | None = None,
         default_fps: int = 16,
     ) -> None:
         """Initialize modality-specific output formatters.
@@ -1458,76 +1697,198 @@ class OutputFormatter:
         Returns:
             None.
         """
-        diffusion_formatter = DiffusionFormatter(
+        self._model_name = model_name
+        self._media_fs = media_fs
+        self._text = TextFormatter(model_name)
+        self._diffusion = DiffusionFormatter(
             model_name, media_fs, media_http_url, default_fps
         )
-        self._formatters: Dict[str, Any] = {
-            "text": TextFormatter(model_name),
-            "image": diffusion_formatter,
-            "video": diffusion_formatter,
-            "audio": AudioFormatter(model_name, media_fs, media_http_url),
-        }
+        self._audio = AudioFormatter(model_name, media_fs, media_http_url)
+
+    def engine_context(
+        self,
+        request_type: RequestType,
+        *,
+        response_format: str | None = None,
+        output_format: str | None = None,
+        fps: int = 0,
+        speed: float = 1.0,
+    ) -> FormatContext:
+        """Validate the aggregated handler's request intent before any stage runs.
+
+        Args:
+            request_type: Request kind parsed at the entry point.
+            response_format: Requested representation, if any.
+            output_format: Requested container or codec, if any.
+            fps: Requested frame rate; ``0`` means unset.
+            speed: Requested audio retiming; ``1.0`` means unset.
+
+        Returns:
+            FormatContext: The validated context for this request.
+
+        Raises:
+            FormatContractError: If the intent is unusable on this deployment.
+        """
+        return FormatContext.from_engine_inputs(
+            request_type,
+            response_format=response_format,
+            output_format=output_format,
+            fps=fps,
+            speed=speed,
+            media_storage_available=self._media_fs is not None,
+        )
+
+    def request_context(
+        self, request: Mapping, request_type: RequestType
+    ) -> FormatContext:
+        """Validate the disaggregated router's raw request intent.
+
+        Args:
+            request: Raw frontend request mapping.
+            request_type: Request kind parsed from that request.
+
+        Returns:
+            FormatContext: The validated context for this request.
+
+        Raises:
+            FormatContractError: If the intent is unusable on this deployment.
+        """
+        return FormatContext.from_request(
+            request,
+            request_type,
+            media_storage_available=self._media_fs is not None,
+        )
 
     async def format(
         self,
+        context: FormatContext,
         stage_output: Any,
-        request_id: str,
-        *,
-        request_type: Any = None,
-        **ctx: Any,
-    ) -> Dict[str, Any] | None:
-        """Dispatch a stage output to its modality formatter.
+        session: FormatSession,
+    ) -> FormattingOutcome:
+        """Format one stage output under a request's validated context.
 
         Args:
+            context: Validated request intent and options.
             stage_output: vLLM-Omni output carrying ``final_output_type``.
-            request_id: Identifier included in the formatted response.
-            request_type: Request kind used by diffusion formatting.
-            **ctx: Modality-specific formatting and stream-state options.
+            session: The request's own state.
 
         Returns:
-            Dict[str, Any] | None: Formatted response or ``None`` when unsupported.
+            FormattingOutcome: What this stage contributed; a legal gap and a
+                failure are different values, never a shared ``None``.
 
         Raises:
-            ValueError: If modality-specific formatting options are invalid.
             AttributeError: If a text output lacks required generation fields.
+            ValueError: If a diffusion response option is unsupported.
         """
-        fmt_type = getattr(stage_output, "final_output_type", None)
-        formatter = self._formatters.get(fmt_type) if fmt_type else None
-        if formatter is None:
-            return None
+        dispatch = resolve_dispatch(context, stage_output)
+        if isinstance(dispatch, Failed):
+            outcome = self._failure(session, dispatch.error)
+        else:
+            outcome = await self._run_dispatch(dispatch, context, stage_output, session)
+        session.advance_text(stage_output)
+        if isinstance(outcome, Emitted):
+            session.note_emitted()
+        elif isinstance(outcome, Failed):
+            session.note_failed()
+        return outcome
 
-        # TextFormatter is sync and takes request_output, not stage_output.
-        if fmt_type == "text":
-            ro = getattr(stage_output, "request_output", None)
-            if not ro:
-                return None
-            return formatter.format(
-                ro, request_id, previous_text=ctx.get("previous_text", "")
+    async def finish(
+        self, context: FormatContext, session: FormatSession
+    ) -> FormattingOutcome:
+        """Finalize a request exactly once.
+
+        Encodes whatever the request buffered and reports whether the request
+        produced anything at all. The result is latched on the session, so a
+        repeated finish re-encodes nothing and re-uploads nothing.
+
+        Args:
+            context: Validated request intent and options.
+            session: The request's own state.
+
+        Returns:
+            FormattingOutcome: ``Emitted`` with the buffered result, or an
+                explicit ``NoEmission``/``Failed``; never a silent empty
+                success for a request that produced nothing.
+        """
+        if session.final_outcome is not None:
+            return session.final_outcome
+
+        if session.aborted:
+            outcome: FormattingOutcome = NoEmission(NoEmissionReason.ABORTED)
+        elif session.reported_failure:
+            # The failure body is already on its way; adding a second one at
+            # the request end would answer one broken step with two responses.
+            outcome = NoEmission(NoEmissionReason.COMPLETE)
+        elif session.audio_aggregate_state is not None:
+            outcome = await self._audio.finalize_aggregate(
+                session.request_id,
+                session.audio_aggregate_state,
+                response_format=context.response_format,
+                output_format=context.output_format,
+                speed=context.speed if context.speed is not None else 1.0,
             )
+        elif session.emitted:
+            outcome = NoEmission(NoEmissionReason.COMPLETE)
+        else:
+            outcome = self._failure(
+                session,
+                f"No {session.modality.value} output was produced for this request",
+            )
+        session.final_outcome = outcome
+        session.release_audio()
+        return outcome
 
-        return await formatter.format(
-            stage_output, request_id, request_type=request_type, **ctx
+    async def _run_dispatch(
+        self,
+        dispatch: StageDispatch,
+        context: FormatContext,
+        stage_output: Any,
+        session: FormatSession,
+    ) -> FormattingOutcome:
+        """Send one resolved stage to the formatter that owns its modality."""
+        if dispatch.modality is Modality.TEXT:
+            request_output = getattr(stage_output, "request_output", None)
+            if request_output is None:
+                # The stage carries no engine output on this step, so there is
+                # no delta to serialize. Legal mid-stream, not a failure.
+                return NoEmission(NoEmissionReason.STREAM_GAP)
+            return self._text.run(
+                request_output,
+                session.request_id,
+                previous_text=session.previous_text,
+            )
+        if dispatch.modality is Modality.AUDIO:
+            return await self._audio.run(
+                stage_output,
+                session.request_id,
+                response_format=context.response_format,
+                output_format=context.output_format,
+                speed=context.speed if context.speed is not None else 1.0,
+                audio_stream_state=session.audio_stream_state,
+                audio_aggregate_state=session.audio_aggregate_state,
+            )
+        return await self._diffusion.run(
+            stage_output,
+            session.request_id,
+            dispatch=dispatch,
+            fps=context.fps,
+            response_format=context.response_format,
+            output_format=context.output_format,
         )
 
-    async def finish_audio(
+    def _failure(
         self,
-        request_id: str,
-        aggregate_state: AudioAggregateState,
-        **ctx: Any,
-    ) -> Dict[str, Any]:
-        """Finalize buffered audio through the audio formatter.
-
-        Args:
-            request_id: Identifier included in the formatted response.
-            aggregate_state: Buffered audio chunks and their shared metadata.
-            **ctx: Audio encoding, response, and speed options.
-
-        Returns:
-            Dict[str, Any]: Completed or failed audio response.
-
-        Raises:
-            ValueError: If buffered chunks cannot be concatenated.
-        """
-        return await self._formatters["audio"].finish_aggregate(
-            request_id, aggregate_state, **ctx
+        session: FormatSession,
+        error: str,
+        modality: Modality | None = None,
+    ) -> Failed:
+        """Build a failure outcome carrying this modality's failure body."""
+        return Failed(
+            error=error,
+            compatible_payload=_failure_payload(
+                modality or session.modality,
+                session.request_id,
+                self._model_name,
+                error,
+            ),
         )

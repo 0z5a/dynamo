@@ -6,14 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from dynamo.common.lora.manager import LoRAInfo
 
 try:
-    from PIL import Image
-    from vllm.sampling_params import RequestOutputKind, SamplingParams
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
     from dynamo.common.protocols.audio_protocol import NvCreateAudioSpeechRequest
     from dynamo.common.protocols.image_protocol import NvCreateImageRequest
     from dynamo.common.protocols.video_protocol import NvCreateVideoRequest, VideoNvExt
@@ -21,8 +16,16 @@ try:
     from dynamo.llm.exceptions import InvalidArgument
     from dynamo.vllm.lora_state import LoRAState
     from dynamo.vllm.omni.audio_handler import AudioGenerationHandler
+    from dynamo.vllm.omni.format_contract import (
+        Emitted,
+        Failed,
+        FormatSession,
+        NoEmission,
+        NoEmissionReason,
+    )
     from dynamo.vllm.omni.main import _register_lora_engine_routes
     from dynamo.vllm.omni.omni_handler import EngineInputs, OmniHandler
+    from dynamo.vllm.omni.output_formatter import AudioFormatter, OutputFormatter
     from dynamo.vllm.omni.utils import (
         MAX_IMAGE_DIMENSION,
         build_original_prompt,
@@ -30,6 +33,9 @@ try:
         parse_omni_request,
         streaming_sampling_params,
     )
+    from PIL import Image
+    from vllm.sampling_params import RequestOutputKind, SamplingParams
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 except ImportError:
     pytest.skip("vLLM omni dependencies not available", allow_module_level=True)
 
@@ -464,7 +470,7 @@ class TestAggregatedAudioFollowsOutputKind:
         import numpy as np
 
         handler = _make_handler(stage_types=("llm",))
-        cumulative = dict(sampling_params_list=_cumulative_stage_params())
+        cumulative = {"sampling_params_list": _cumulative_stage_params()}
         await self._run(handler, [self._audio_output([0.2] * 2400)], **cumulative)
         chunks = await self._run(
             handler,
@@ -477,6 +483,367 @@ class TestAggregatedAudioFollowsOutputKind:
         audio, _ = self._decode(chunks[0])
         assert len(audio) == 1200
         assert np.allclose(audio, 0.1, atol=1e-3)
+
+
+class TestAggregatedFormattingContract:
+    """The aggregated caller reads the same contract the router reads.
+
+    Every test names the regression it pins. The handler's own bookkeeping --
+    previous text, audio buffers, the finish latch -- lives on the request's
+    FormatSession, so these tests drive the real OutputFormatter and inspect
+    the outcomes rather than any caller-private shim.
+    """
+
+    @staticmethod
+    def _audio_stage(samples, sample_rate=24000):
+        import numpy as np
+
+        return SimpleNamespace(
+            final_output_type="audio",
+            multimodal_output={
+                "audio": np.asarray(samples, dtype=np.float32),
+                "sr": sample_rate,
+            },
+        )
+
+    @staticmethod
+    def _spy_session_and_context(monkeypatch):
+        """Record the session and context the handler opens for a request."""
+        opened = []
+        contexts = []
+        original_for_request = FormatSession.for_request.__func__
+        original_engine_context = OutputFormatter.engine_context
+
+        def for_request(cls, request_id, request_type, **kwargs):
+            session = original_for_request(cls, request_id, request_type, **kwargs)
+            opened.append(session)
+            return session
+
+        def engine_context(self, request_type, **options):
+            context = original_engine_context(self, request_type, **options)
+            contexts.append(context)
+            return context
+
+        monkeypatch.setattr(FormatSession, "for_request", classmethod(for_request))
+        monkeypatch.setattr(OutputFormatter, "engine_context", engine_context)
+        return opened, contexts
+
+    @staticmethod
+    def _count_encodes(monkeypatch):
+        """Count whole-file audio encodes, the unit a double finish would repeat."""
+        encoded = []
+        original = AudioFormatter._encode_audio
+
+        def _counting(self, *args, **kwargs):
+            encoded.append(args)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(AudioFormatter, "_encode_audio", _counting)
+        return encoded
+
+    @staticmethod
+    def _no_abort_monitor():
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def no_abort_monitor(context, request_id):
+            yield None
+
+        return no_abort_monitor
+
+    async def _run_text(self, handler, texts):
+        """Drive one chat request whose engine streams cumulative text."""
+
+        async def fake_generate(**kwargs):
+            for index, text in enumerate(texts):
+                last = index == len(texts) - 1
+                yield SimpleNamespace(
+                    final_output_type="text",
+                    request_output=SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                text=text,
+                                finish_reason="stop" if last else None,
+                                token_ids=[1, 2, 3],
+                            )
+                        ],
+                        prompt_token_ids=[10, 20, 30],
+                        num_cached_tokens=None,
+                    ),
+                )
+
+        handler.engine_client.generate = fake_generate
+        handler._abort_monitor = self._no_abort_monitor()
+        handler.config.output_modalities = ["text"]
+        return [
+            c
+            async for c in handler._generate_openai_mode(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                MagicMock(),
+                "req-text",
+            )
+        ]
+
+    async def _run_audio(self, handler, stage_outputs, inputs, samples=None):
+        """Drive one audio request with the engine inputs under test."""
+
+        async def fake_generate(**kwargs):
+            for stage_output in stage_outputs:
+                yield stage_output
+
+        handler.engine_client.generate = fake_generate
+        handler._abort_monitor = self._no_abort_monitor()
+        handler.config.output_modalities = ["audio"]
+        handler.audio = MagicMock()
+        handler.audio.build_engine_inputs = _AsyncReturn(inputs)
+        return [
+            c
+            async for c in handler._generate_openai_mode(
+                {"input": "hi"}, MagicMock(), "req-1"
+            )
+        ]
+
+    # ── A3-T05: the same legal gap the router sees ────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t05_buffered_audio_is_not_reported_as_an_error(self):
+        handler = _make_handler(stage_types=("llm",))
+        chunks = await TestAggregatedAudioFollowsOutputKind()._run(
+            handler,
+            [
+                self._audio_stage([0.1] * 1200),
+                self._audio_stage([0.2] * 1200),
+            ],
+            sampling_params_list=[SamplingParams()],
+        )
+
+        assert len(chunks) == 1
+        assert chunks[0]["status"] == "completed"
+        assert chunks[0]["error"] is None
+
+    # ── A3-T07: text advances exactly once ────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t07_deltas_are_neither_duplicated_nor_dropped(self):
+        """A second advance of the same stage would truncate the next delta."""
+        handler = _make_handler(stage_types=("llm",))
+        handler.output_formatter = OutputFormatter(model_name="test-model")
+
+        chunks = await self._run_text(handler, ["Hello", "Hello world", "Hello world!"])
+
+        text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        assert text == "Hello world!"
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[-1]["usage"]["completion_tokens"] == 3
+        assert all("usage" not in chunk for chunk in chunks[:-1])
+
+    # ── A3-T09/T10: one encode, emitted once, latched ─────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t09_aggregate_encodes_and_emits_exactly_once(self, monkeypatch):
+        encoded = self._count_encodes(monkeypatch)
+        opened, _ = self._spy_session_and_context(monkeypatch)
+        handler = _make_handler(stage_types=("llm",))
+
+        chunks = await TestAggregatedAudioFollowsOutputKind()._run(
+            handler,
+            [
+                self._audio_stage([0.1] * 1200),
+                self._audio_stage([0.1] * 2400),
+                self._audio_stage([0.1] * 3600),
+            ],
+            sampling_params_list=[SamplingParams()],
+        )
+
+        assert len(chunks) == 1
+        assert chunks[0]["status"] == "completed"
+        assert len(encoded) == 1
+        assert opened[0].audio_aggregate_state.chunks == []
+
+    @pytest.mark.asyncio
+    async def test_a3_t10_a_second_finish_neither_re_encodes_nor_re_emits(
+        self, monkeypatch
+    ):
+        encoded = self._count_encodes(monkeypatch)
+        opened, contexts = self._spy_session_and_context(monkeypatch)
+        handler = _make_handler(stage_types=("llm",))
+        chunks = await TestAggregatedAudioFollowsOutputKind()._run(
+            handler,
+            [self._audio_stage([0.1] * 1200)],
+            sampling_params_list=[SamplingParams()],
+        )
+        assert len(chunks) == 1
+
+        again = await handler.output_formatter.finish(contexts[0], opened[0])
+
+        assert isinstance(again, Emitted)
+        assert again.payload is chunks[0]
+        assert len(encoded) == 1
+
+    # ── A3-T12: a failed stream is not a success ──────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t12_engine_failure_aborts_and_releases_the_request(
+        self, monkeypatch
+    ):
+        opened, contexts = self._spy_session_and_context(monkeypatch)
+        handler = _make_handler(stage_types=("llm",))
+        handler.output_formatter = OutputFormatter(model_name="test-model")
+
+        async def exploding_generate(**kwargs):
+            yield self._audio_stage([0.1] * 1200)
+            raise RuntimeError("engine exploded")
+
+        handler.engine_client.generate = exploding_generate
+        handler._abort_monitor = self._no_abort_monitor()
+        handler.config.output_modalities = ["audio"]
+        handler.audio = MagicMock()
+        handler.audio.build_engine_inputs = _AsyncReturn(
+            EngineInputs(
+                prompt={"prompt": "hi"},
+                request_type=RequestType.AUDIO_GENERATION,
+                sampling_params_list=[SamplingParams()],
+            )
+        )
+
+        chunks = [
+            c
+            async for c in handler._generate_openai_mode(
+                {"input": "hi"}, MagicMock(), "req-1"
+            )
+        ]
+
+        # An audio request reports a mid-stream engine failure in the audio
+        # body the client actually receives. The exception path and the error
+        # body are unchanged from before this refactor, so no chat chunk is
+        # produced here and asserting one would test a fabricated shape.
+        assert [c.get("status") for c in chunks] == ["failed"]
+        assert "engine exploded" in chunks[0]["error"]
+        assert opened[0].aborted is True
+        assert opened[0].audio_aggregate_state.chunks == []
+
+        outcome = await handler.output_formatter.finish(contexts[0], opened[0])
+        assert isinstance(outcome, NoEmission)
+        assert outcome.reason is NoEmissionReason.ABORTED
+
+    # ── A3-T02/T13: request-level validation before generation ────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t02_invalid_video_option_never_starts_generation(self):
+        handler = _make_handler(stage_types=("diffusion",))
+        handler.output_formatter = OutputFormatter(
+            model_name="test-model", media_fs=object()
+        )
+        handler.config.output_modalities = ["video"]
+        started = []
+
+        async def fake_generate(**kwargs):
+            started.append(kwargs)
+            yield SimpleNamespace(final_output_type="image", images=[])
+
+        handler.engine_client.generate = fake_generate
+
+        with pytest.raises(InvalidArgument, match="output_format"):
+            [
+                c
+                async for c in handler._generate_openai_mode(
+                    {
+                        "model": "test-model",
+                        "prompt": "a drone",
+                        "output_format": "webm",
+                    },
+                    MagicMock(),
+                    "req-1",
+                )
+            ]
+
+        assert started == []
+
+    @pytest.mark.asyncio
+    async def test_a3_t13_video_url_without_storage_is_a_request_error(self):
+        handler = _make_handler(stage_types=("diffusion",))
+        handler.output_formatter = OutputFormatter(
+            model_name="test-model", media_fs=None
+        )
+        handler.config.output_modalities = ["video"]
+
+        with pytest.raises(InvalidArgument, match="media storage"):
+            [
+                c
+                async for c in handler._generate_openai_mode(
+                    {
+                        "model": "test-model",
+                        "prompt": "a drone",
+                        "response_format": "url",
+                    },
+                    MagicMock(),
+                    "req-1",
+                )
+            ]
+
+    # ── A3-T14: an upload failure maps to the modality failure body ───────
+
+    @pytest.mark.asyncio
+    async def test_a3_t14_upload_failure_yields_the_audio_failure_body(
+        self, monkeypatch
+    ):
+        async def _boom(*args, **kwargs):
+            raise OSError("storage backend refused the upload")
+
+        monkeypatch.setattr("dynamo.vllm.omni.output_formatter.upload_to_fs", _boom)
+        handler = _make_handler(stage_types=("llm",))
+        handler.output_formatter = OutputFormatter(
+            model_name="test-model", media_fs=object()
+        )
+
+        chunks = await self._run_audio(
+            handler,
+            [self._audio_stage([0.1] * 2400)],
+            EngineInputs(
+                prompt={"prompt": "hi"},
+                request_type=RequestType.AUDIO_GENERATION,
+                response_format="url",
+                sampling_params_list=[SamplingParams()],
+            ),
+        )
+
+        assert len(chunks) == 1
+        assert chunks[0]["status"] == "failed"
+        assert "storage backend refused" in chunks[0]["error"]
+
+    # ── A3-T18: nothing emitted is an explicit failure ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t18_a_request_that_emitted_nothing_fails_explicitly(self):
+        handler = _make_handler(stage_types=("llm",))
+        chunks = await TestAggregatedAudioFollowsOutputKind()._run(
+            handler,
+            [SimpleNamespace(final_output_type="unknown")],
+        )
+
+        assert len(chunks) == 1
+        assert chunks[0]["status"] == "failed"
+        # An audio request reports failure in the audio body; there is no
+        # chat chunk to read, and inventing one would be a fabricated error.
+        assert chunks[0]["error"]
+
+    # ── Outcome consumption is exhaustive ─────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a3_t06_failure_outcome_is_never_a_bare_none(self):
+        """A Failed outcome always carries the body the client will see."""
+        from dynamo.vllm.omni.format_contract import serialize_outcome
+
+        formatter = OutputFormatter(model_name="test-model")
+        context = formatter.engine_context(RequestType.AUDIO_GENERATION)
+        session = FormatSession.for_request("req-1", RequestType.AUDIO_GENERATION)
+
+        outcome = await formatter.format(
+            context, SimpleNamespace(final_output_type="hologram"), session
+        )
+
+        assert isinstance(outcome, Failed)
+        assert serialize_outcome(outcome) is not None
 
 
 class _AsyncReturn:
@@ -885,12 +1252,14 @@ class TestLoraEnablement:
         handler = _make_handler()
         handler.config.engine_args.enable_lora = True
 
-        with patch(
-            "dynamo.vllm.omni.omni_handler.get_lora_manager",
-            return_value=MagicMock(),
+        with (
+            patch(
+                "dynamo.vllm.omni.omni_handler.get_lora_manager",
+                return_value=MagicMock(),
+            ),
+            pytest.raises(ValueError, match="unknown model or LoRA adapter"),
         ):
-            with pytest.raises(ValueError, match="unknown model or LoRA adapter"):
-                handler._resolve_lora_request("ghost-adapter")
+            handler._resolve_lora_request("ghost-adapter")
 
     def test_resolve_lora_request_unknown_adapter_is_none_when_manager_missing(self):
         handler = _make_handler()

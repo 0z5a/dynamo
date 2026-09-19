@@ -13,12 +13,23 @@ import pytest
 
 try:
     import torch
-
+    from dynamo.common.utils.output_modalities import RequestType
+    from dynamo.vllm.omni.format_contract import (
+        Emitted,
+        Failed,
+        FormatSession,
+        Modality,
+        NoEmission,
+        NoEmissionReason,
+        ResponseSchema,
+        StageDispatch,
+    )
     from dynamo.vllm.omni.output_formatter import (
         AudioAggregateState,
         AudioFormatter,
         AudioStreamState,
         DiffusionFormatter,
+        OutputFormatter,
         TextFormatter,
         _build_completion_usage,
         _error_chunk,
@@ -36,6 +47,21 @@ pytestmark = [
     pytest.mark.profiled_vram_gib(0),
     pytest.mark.timeout(180),  # 0-GiB unit tests, floor 180s
 ]
+
+
+def _resolved(modality, schema=ResponseSchema.MEDIA):
+    """The dispatch ``resolve_dispatch`` hands to a concrete formatter."""
+    return StageDispatch(
+        modality=modality, schema=schema, final_output_type=modality.value
+    )
+
+
+def _text_stage(text, finish_reason=None):
+    """A text stage output as the engine emits it."""
+    return SimpleNamespace(
+        final_output_type="text",
+        request_output=_make_request_output(text, finish_reason),
+    )
 
 
 # ── TextFormatter ──────────────────────────────────────────
@@ -166,20 +192,16 @@ class TestDiffusionFormatterPrepareImages:
 class TestDiffusionFormatterImage:
     @pytest.mark.asyncio
     async def test_chat_completion_format(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         img = MagicMock()
         img.save = lambda b, format: b.write(b"px")
-        chunk = await f._encode_image(
-            [img], "req-1", request_type=RequestType.CHAT_COMPLETION
-        )
+        chunk = await f._encode_image([img], "req-1", schema=ResponseSchema.CHAT_CHUNK)
         assert chunk["object"] == "chat.completion.chunk"
         assert chunk["choices"][0]["delta"]["content"][0]["type"] == "image_url"
 
     @pytest.mark.asyncio
     async def test_image_generation_b64_format(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         img = MagicMock()
@@ -188,13 +210,12 @@ class TestDiffusionFormatterImage:
             [img],
             "req-1",
             response_format="b64_json",
-            request_type=RequestType.IMAGE_GENERATION,
+            schema=ResponseSchema.MEDIA,
         )
         assert chunk["data"][0]["b64_json"] is not None
 
     @pytest.mark.asyncio
     async def test_image_generation_default_format_returns_b64(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         img = MagicMock()
@@ -203,32 +224,26 @@ class TestDiffusionFormatterImage:
             [img],
             "req-1",
             response_format=None,
-            request_type=RequestType.IMAGE_GENERATION,
+            schema=ResponseSchema.MEDIA,
         )
         assert chunk["data"][0]["b64_json"] is not None
 
     @pytest.mark.asyncio
     async def test_empty_images_returns_error(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
-        chunk = await f._encode_image(
-            [], "req-1", request_type=RequestType.IMAGE_GENERATION
-        )
+        chunk = await f._encode_image([], "req-1", schema=ResponseSchema.MEDIA)
         assert "Error" in chunk["choices"][0]["delta"]["content"]
 
 
 class TestDiffusionFormatterVideo:
     @pytest.mark.asyncio
     async def test_empty_frames_returns_video_error(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         stage = MagicMock()
         stage.images = []
-        result = await f.format(
-            stage, "req-1", request_type=RequestType.VIDEO_GENERATION
-        )
+        result = await f.format(stage, "req-1", dispatch=_resolved(Modality.VIDEO))
         assert result["object"] == "video"
         assert result["status"] == "failed"
         assert "No video outputs" in result["error"]
@@ -248,7 +263,6 @@ class TestDiffusionFormatterVideo:
 
     @pytest.mark.asyncio
     async def test_muxes_video_audio_and_reports_metadata(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         stage = SimpleNamespace(
@@ -266,7 +280,7 @@ class TestDiffusionFormatterVideo:
             result = await f.format(
                 stage,
                 "req-video-audio",
-                request_type=RequestType.VIDEO_GENERATION,
+                dispatch=_resolved(Modality.VIDEO),
                 response_format="b64_json",
             )
 
@@ -285,7 +299,6 @@ class TestDiffusionFormatterVideo:
         [("sample_rate", 22050), ("sampling_rate", 44100), ("sr", 16000)],
     )
     async def test_uses_audio_sample_rate_aliases(self, sample_rate_key, sample_rate):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         stage = SimpleNamespace(
@@ -304,7 +317,7 @@ class TestDiffusionFormatterVideo:
             result = await f.format(
                 stage,
                 "req-video-audio",
-                request_type=RequestType.VIDEO_GENERATION,
+                dispatch=_resolved(Modality.VIDEO),
                 response_format="b64_json",
             )
 
@@ -333,7 +346,6 @@ class TestDiffusionFormatterVideo:
 
     @pytest.mark.asyncio
     async def test_returns_every_generated_video(self):
-        from dynamo.common.utils.output_modalities import RequestType
 
         f = _make_diffusion_formatter()
         videos = [np.zeros((2, 4, 4, 3), dtype=np.float32) for _ in range(2)]
@@ -354,7 +366,7 @@ class TestDiffusionFormatterVideo:
             result = await f.format(
                 stage,
                 "req-video-audio",
-                request_type=RequestType.VIDEO_GENERATION,
+                dispatch=_resolved(Modality.VIDEO),
                 response_format="b64_json",
             )
 
@@ -595,7 +607,6 @@ class TestBuildCompletionUsage:
 class TestAudioFormatterExtractTensor:
     def test_extracts_from_audio_key(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -606,7 +617,6 @@ class TestAudioFormatterExtractTensor:
 
     def test_extracts_from_model_outputs_key(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -624,7 +634,6 @@ class TestAudioFormatterExtractTensor:
 
     def test_preserves_channel_dimension(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -636,7 +645,6 @@ class TestAudioFormatterExtractTensor:
 class TestAudioFormatterEncode:
     def test_wav_encoding(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -648,7 +656,6 @@ class TestAudioFormatterEncode:
 
     def test_unsupported_format_falls_back_to_wav(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -657,7 +664,6 @@ class TestAudioFormatterEncode:
 
     def test_default_format_is_wav(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -771,7 +777,6 @@ class TestAudioFormatterFormat:
     @pytest.mark.asyncio
     async def test_successful_generation(self):
         import numpy as np
-
         from dynamo.vllm.omni.output_formatter import AudioFormatter
 
         f = AudioFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -1204,82 +1209,89 @@ class TestAudioFormatterCumulativeAggregate:
 
 
 class TestOutputFormatter:
-    """Tests pass the full ctx that _generate_openai_mode actually sends
-    (request_type, fps, response_format, previous_text, speed) to catch
-    signature mismatches in individual formatters early."""
+    """Tests drive the entry sequence both callers use -- a validated context, a
+    per-request session, then format()/finish() -- so a mismatch between the
+    contract and a concrete formatter shows up here first."""
 
-    # Full ctx matching _generate_openai_mode's call signature
-    _FULL_CTX = dict(fps=16, response_format=None, previous_text="", speed=1.0)
+    @staticmethod
+    def _formatter():
+        return OutputFormatter(model_name="test-model")
 
     @pytest.mark.asyncio
     async def test_routes_text(self):
-        from dynamo.common.utils.output_modalities import RequestType
-        from dynamo.vllm.omni.output_formatter import OutputFormatter
+        f = self._formatter()
+        context = f.engine_context(RequestType.CHAT_COMPLETION, fps=16, speed=1.0)
+        session = FormatSession.for_request("req-1", RequestType.CHAT_COMPLETION)
 
-        f = OutputFormatter(model_name="test-model")
-        stage = MagicMock()
-        stage.final_output_type = "text"
-        stage.request_output = _make_request_output("hello world")
-        chunk = await f.format(
-            stage, "req-1", request_type=RequestType.CHAT_COMPLETION, **self._FULL_CTX
-        )
-        assert chunk["choices"][0]["delta"]["content"] == "hello world"
+        outcome = await f.format(context, _text_stage("hello world"), session)
+
+        assert isinstance(outcome, Emitted)
+        assert outcome.payload["choices"][0]["delta"]["content"] == "hello world"
 
     @pytest.mark.asyncio
     async def test_routes_image(self):
-        from dynamo.common.utils.output_modalities import RequestType
-        from dynamo.vllm.omni.output_formatter import OutputFormatter
-
-        f = OutputFormatter(model_name="test-model")
-        stage = MagicMock()
-        stage.final_output_type = "image"
+        f = self._formatter()
+        context = f.engine_context(RequestType.CHAT_COMPLETION)
+        session = FormatSession.for_request("req-1", RequestType.CHAT_COMPLETION)
         img = MagicMock()
         img.save = lambda b, format: b.write(b"px")
-        stage.images = [img]
-        chunk = await f.format(
-            stage, "req-1", request_type=RequestType.CHAT_COMPLETION, **self._FULL_CTX
+        stage = SimpleNamespace(final_output_type="image", images=[img])
+
+        outcome = await f.format(context, stage, session)
+
+        assert isinstance(outcome, Emitted)
+        assert (
+            outcome.payload["choices"][0]["delta"]["content"][0]["type"] == "image_url"
         )
-        assert chunk["choices"][0]["delta"]["content"][0]["type"] == "image_url"
 
     @pytest.mark.asyncio
     async def test_routes_audio(self):
-        import numpy as np
-
-        from dynamo.common.utils.output_modalities import RequestType
-        from dynamo.vllm.omni.output_formatter import OutputFormatter
-
-        f = OutputFormatter(model_name="test-model")
-        stage = MagicMock()
-        stage.final_output_type = "audio"
-        stage.multimodal_output = {
-            "audio": np.random.randn(2400).astype(np.float32),
-            "sr": 24000,
-        }
-        chunk = await f.format(
-            stage, "req-1", request_type=RequestType.AUDIO_GENERATION, **self._FULL_CTX
+        f = self._formatter()
+        context = f.engine_context(RequestType.AUDIO_GENERATION)
+        session = FormatSession.for_request("req-1", RequestType.AUDIO_GENERATION)
+        stage = SimpleNamespace(
+            final_output_type="audio",
+            multimodal_output={
+                "audio": np.random.randn(2400).astype(np.float32),
+                "sr": 24000,
+            },
         )
-        assert chunk["status"] == "completed"
+
+        outcome = await f.format(context, stage, session)
+
+        # An audio request that does not stream buffers into the request session.
+        assert isinstance(outcome, NoEmission)
+        assert outcome.reason is NoEmissionReason.BUFFERED
+
+        final = await f.finish(context, session)
+        assert isinstance(final, Emitted)
+        assert final.payload["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_unknown_type_returns_none(self):
-        from dynamo.vllm.omni.output_formatter import OutputFormatter
+    async def test_unknown_type_is_a_failure_not_a_gap(self):
+        """An unlabelled stage is an explicit failure, not a silent ``None``."""
+        f = self._formatter()
+        context = f.engine_context(RequestType.CHAT_COMPLETION)
+        session = FormatSession.for_request("req-1", RequestType.CHAT_COMPLETION)
+        stage = SimpleNamespace(final_output_type="unknown_modality")
 
-        f = OutputFormatter(model_name="test-model")
-        stage = MagicMock()
-        stage.final_output_type = "unknown_modality"
-        result = await f.format(stage, "req-1")
-        assert result is None
+        outcome = await f.format(context, stage, session)
+
+        assert isinstance(outcome, Failed)
+        assert "unknown_modality" in outcome.error
+        assert outcome.compatible_payload is not None
 
     @pytest.mark.asyncio
-    async def test_text_without_request_output_returns_none(self):
-        from dynamo.vllm.omni.output_formatter import OutputFormatter
+    async def test_text_without_request_output_is_a_legal_gap(self):
+        f = self._formatter()
+        context = f.engine_context(RequestType.CHAT_COMPLETION)
+        session = FormatSession.for_request("req-1", RequestType.CHAT_COMPLETION)
+        stage = SimpleNamespace(final_output_type="text", request_output=None)
 
-        f = OutputFormatter(model_name="test-model")
-        stage = MagicMock()
-        stage.final_output_type = "text"
-        stage.request_output = None
-        result = await f.format(stage, "req-1")
-        assert result is None
+        outcome = await f.format(context, stage, session)
+
+        assert isinstance(outcome, NoEmission)
+        assert outcome.reason is NoEmissionReason.STREAM_GAP
 
 
 # ── AudioFormatter — output_format field (new branch behavior) ──────────────
@@ -1384,7 +1396,6 @@ class TestDiffusionFormatterVideoOutputFormat:
 
     @pytest.mark.asyncio
     async def test_video_url_response_format(self):
-        from dynamo.common.utils.output_modalities import RequestType
         from dynamo.vllm.omni.output_formatter import DiffusionFormatter
 
         f = DiffusionFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -1396,7 +1407,7 @@ class TestDiffusionFormatterVideoOutputFormat:
             result = await f.format(
                 stage,
                 "r5",
-                request_type=RequestType.VIDEO_GENERATION,
+                dispatch=_resolved(Modality.VIDEO),
                 fps=16,
                 response_format="url",
             )
@@ -1411,7 +1422,6 @@ class TestDiffusionFormatterVideoOutputFormat:
     async def test_video_b64_response_format(self):
         import base64
 
-        from dynamo.common.utils.output_modalities import RequestType
         from dynamo.vllm.omni.output_formatter import DiffusionFormatter
 
         f = DiffusionFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -1423,7 +1433,7 @@ class TestDiffusionFormatterVideoOutputFormat:
             result = await f.format(
                 stage,
                 "r6",
-                request_type=RequestType.VIDEO_GENERATION,
+                dispatch=_resolved(Modality.VIDEO),
                 fps=16,
                 response_format="b64_json",
             )
@@ -1438,7 +1448,6 @@ class TestDiffusionFormatterVideoOutputFormat:
     @pytest.mark.asyncio
     async def test_video_default_response_format_is_url(self):
         """Omitting response_format defaults to url."""
-        from dynamo.common.utils.output_modalities import RequestType
         from dynamo.vllm.omni.output_formatter import DiffusionFormatter
 
         f = DiffusionFormatter(model_name="test", media_fs=None, media_http_url=None)
@@ -1448,7 +1457,7 @@ class TestDiffusionFormatterVideoOutputFormat:
         p1, p2, p3, p4, p5 = self._patches()
         with p1, p2, p3, p4 as mock_upload, p5:
             result = await f.format(
-                stage, "r7", request_type=RequestType.VIDEO_GENERATION, fps=16
+                stage, "r7", dispatch=_resolved(Modality.VIDEO), fps=16
             )
 
         assert result is not None

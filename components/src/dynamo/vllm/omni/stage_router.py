@@ -6,15 +6,13 @@
 import json
 import logging
 import uuid
-from typing import Any, AsyncGenerator, Dict, List
-
-from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from dynamo import prometheus_names
 from dynamo.common.model_taints import register_model_taint_route
 from dynamo.common.storage import get_fs
 from dynamo.common.utils.output_modalities import (
-    RequestType,
     get_output_modalities,
     parse_request_type,
 )
@@ -23,6 +21,13 @@ from dynamo.runtime import DistributedRuntime
 from dynamo.vllm.main import setup_metrics_collection
 from dynamo.vllm.omni.args import OmniConfig
 from dynamo.vllm.omni.connectors import register_dynamoomni_nixl_connector
+from dynamo.vllm.omni.format_contract import (
+    Emitted,
+    Failed,
+    FormatContext,
+    FormatSession,
+    NoEmission,
+)
 from dynamo.vllm.omni.output_formatter import OutputFormatter
 from dynamo.vllm.omni.stage_worker import (
     _connector_key,
@@ -39,6 +44,7 @@ from dynamo.vllm.omni.utils import (
     shm_deserialize,
     unwrap_connector_payload,
 )
+from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +68,7 @@ class OmniStageRouter:
             ),
             deploy_config_path=stage_configs_path,
         )
-        self.stage_clients: Dict[str, Any] = {}
+        self.stage_clients: dict[str, Any] = {}
 
         # Initialize connectors so the router can fetch final-stage output
         # via connector.get() instead of SHM -- enabling multi-node deployments.
@@ -79,7 +85,9 @@ class OmniStageRouter:
                 raise
 
         try:
-            _, self.connectors = initialize_orchestrator_connectors(connector_configs_path)  # type: ignore[arg-type]
+            _, self.connectors = initialize_orchestrator_connectors(
+                connector_configs_path
+            )  # type: ignore[arg-type]
         except FileNotFoundError:
             logger.warning(
                 "Router: connector config %s not found; continuing without connectors",
@@ -105,12 +113,20 @@ class OmniStageRouter:
     async def generate(
         self,
         request: dict,
-        context,  # noqa: ARG002 — context unused; router generates its own request_id
+        context,
     ) -> AsyncGenerator[dict, None]:
         request_id = str(uuid.uuid4())
         _, request_type = parse_request_type(request, self.config.output_modalities)
+        try:
+            # The same validated boundary the aggregated handler uses: an
+            # unusable option set is rejected here, before any stage runs.
+            format_context = self._formatter.request_context(request, request_type)
+        except ValueError as e:
+            logger.error("Router: invalid request %s: %s", request_id, e)
+            yield {"error": str(e), "finished": True}
+            return
 
-        stage_outputs: List[StageOutput] = []
+        stage_outputs: list[StageOutput] = []
         for stage_idx, stage_cfg in enumerate(self.stage_configs):
             model_stage = getattr(
                 stage_cfg.engine_args, "model_stage", f"stage{stage_idx}"
@@ -167,36 +183,11 @@ class OmniStageRouter:
             yield {"error": error_msg, "finished": True}
             return
 
-        # Build formatting context from the original request
-        nvext = request.get("nvext") or {}
-        fmt_ctx: Dict[str, Any] = {}
-        if nvext.get("fps") is not None:
-            fmt_ctx["fps"] = nvext["fps"]
-        if nvext.get("speed") is not None:
-            fmt_ctx["speed"] = nvext["speed"]
-        # If the request type is AUDIO_GENERATION,
-        # we need to normalize the data_source and response_format to
-        # align with other modalities.
-        response_format = (
-            request.get("data_source")
-            if request_type == RequestType.AUDIO_GENERATION
-            else request.get("response_format")
-        )
-        output_format = (
-            request.get("response_format")
-            if request_type == RequestType.AUDIO_GENERATION
-            else request.get("output_format")
-        )
-        if response_format is not None:
-            fmt_ctx["response_format"] = response_format
-        if output_format is not None:
-            fmt_ctx["output_format"] = output_format
-
+        session = FormatSession.for_request(request_id, request_type)
         async for chunk in self._format_output(
             final,
-            request_id,
-            request_type,
-            fmt_ctx,
+            format_context,
+            session,
             final_stage_id=self.stage_configs[-1].stage_id,
         ):
             yield chunk
@@ -204,12 +195,13 @@ class OmniStageRouter:
     async def _format_output(
         self,
         stage_output: StageOutput,
-        request_id: str,
-        request_type: RequestType,
-        ctx: dict,
+        context: FormatContext,
+        session: FormatSession,
         final_stage_id: int = 0,
     ) -> AsyncGenerator[dict, None]:
-        """Read OmniRequestOutput from connector (multi-node) or SHM (single-node) and format."""
+        """Read the final stage output from the connector (multi-node) or SHM
+        (single-node) and format it under the request's validated context."""
+        request_id = session.request_id
         # --- Connector path (multi-node: router and final stage on different machines) ---
         router_connector = getattr(self, "connectors", {}).get(
             _connector_key(final_stage_id, "router")
@@ -258,21 +250,29 @@ class OmniStageRouter:
                 logger.warning("Router: no shm_meta in stage output")
                 return
             result = shm_deserialize(shm_meta)
-        chunk = await self._formatter.format(
-            result, request_id, request_type=request_type, **ctx
-        )
-        if chunk:
-            yield chunk
-        else:
-            final_output_type = getattr(result, "final_output_type", "unknown")
-            logger.warning(
-                "Router: formatter returned None, final_output_type=%s",
-                final_output_type,
-            )
-            yield {
-                "error": f"Formatter returned no output for type '{final_output_type}'",
-                "finished": True,
-            }
+
+        # Both callers read the same three-way outcome: a stage that legally
+        # carries nothing must not be reported as a pipeline error, and a real
+        # failure is answered with the body its modality already uses.
+        for outcome in (
+            await self._formatter.format(context, result, session),
+            await self._formatter.finish(context, session),
+        ):
+            match outcome:
+                case Emitted(payload):
+                    yield payload
+                case NoEmission(reason=reason):
+                    logger.debug(
+                        "Router: nothing to emit for %s (%s)",
+                        request_id,
+                        reason.value,
+                    )
+                case Failed(error=message, compatible_payload=payload):
+                    logger.error(
+                        "Router: formatting failed for %s: %s", request_id, message
+                    )
+                    if payload is not None:
+                        yield payload
 
 
 async def init_omni_stage_router(
