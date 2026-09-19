@@ -239,6 +239,7 @@ fn port_from_env(name: &str, default: u16) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trtllm_context_first::ConfigError;
 
     #[test]
     fn an_unknown_adapter_mode_is_rejected_rather_than_defaulted() {
@@ -279,5 +280,50 @@ mod tests {
         for mode in [AdapterMode::None, AdapterMode::TrtllmContextFirst] {
             assert_eq!(AdapterMode::parse(mode.as_str()).unwrap(), mode);
         }
+    }
+
+    /// The effective configuration must be visible, because a mode that is on
+    /// without its settings, or off when the operator expected it on, is the
+    /// failure this selector exists to prevent.
+    #[test]
+    fn the_effective_configuration_reports_the_adapter_and_its_budgets() {
+        let limits = ContextFirstLimits::new(
+            4096,
+            8192,
+            16384,
+            Duration::from_secs(7),
+            Duration::from_secs(11),
+        )
+        .expect("valid limits");
+        let config = ContextFirstConfig {
+            context_engine_url: Url::parse("http://context:8000/").unwrap(),
+            limits,
+            namespace: DisaggIdNamespace::new(3, 4).unwrap(),
+        };
+
+        // Every knob the operator can set is readable back off the config, so a
+        // startup log line can state what is actually in force.
+        assert_eq!(config.limits.request_body_bytes, 4096);
+        assert_eq!(config.limits.handoff_body_bytes, 8192);
+        assert_eq!(config.limits.response_body_bytes, 16384);
+        assert_eq!(config.limits.context_deadline, Duration::from_secs(7));
+        assert_eq!(config.limits.generation_deadline, Duration::from_secs(11));
+        assert_eq!(config.namespace.node_id(), 3);
+        assert_eq!(config.namespace.process_id(), 4);
+        assert!(
+            config
+                .context_engine_url
+                .as_str()
+                .starts_with("http://context")
+        );
+    }
+
+    /// A zero response cap is refused as well, so no leg runs unbounded.
+    #[test]
+    fn a_zero_response_cap_is_refused() {
+        assert!(matches!(
+            ContextFirstLimits::new(1, 1, 0, Duration::from_secs(1), Duration::from_secs(1)),
+            Err(ConfigError::ResponseBodyLimit)
+        ));
     }
 }
