@@ -6,11 +6,18 @@ pub mod error;
 pub mod metadata;
 mod proxy;
 pub mod server;
+mod trtllm_context_first;
 
 pub use config::Config;
 pub use error::SidecarError;
 pub use metadata::{PREFILLER_HOST_PORT, PrefillEndpoint};
 pub use server::{PdAdapter, SidecarState, UnavailablePdAdapter, router};
+pub use trtllm_context_first::{
+    ContextHandoff, DisaggIdNamespace, DisaggRequestIds, HandoffError, PROTOCOL_REVISION,
+    PreparedContextRequest, PreparedGenerationRequest, PreparedLeg, RequestError, RequestIds,
+    TrtllmContextFirstContract, decompose_disagg_request_id, parse_context_response,
+    prepare_context_request, prepare_generation_request,
+};
 
 use std::future::IntoFuture;
 use std::sync::Arc;
