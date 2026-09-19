@@ -13,10 +13,12 @@ pub use error::SidecarError;
 pub use metadata::{PREFILLER_HOST_PORT, PrefillEndpoint};
 pub use server::{PdAdapter, SidecarState, UnavailablePdAdapter, router};
 pub use trtllm_context_first::{
-    ContextHandoff, DisaggIdNamespace, DisaggRequestIds, HandoffError, PROTOCOL_REVISION,
-    PreparedContextRequest, PreparedGenerationRequest, PreparedLeg, RequestError, RequestIds,
-    TrtllmContextFirstContract, decompose_disagg_request_id, parse_context_response,
-    prepare_context_request, prepare_generation_request,
+    ContextFirstDispatcher, ContextFirstLimits, ContextHandoff, DisaggIdNamespace,
+    DisaggRequestIds, DispatchError, DispatchOutcome, HandoffError, Leg, LegFailure, LegTransport,
+    OwnedBody, PROTOCOL_REVISION, PreparedContextRequest, PreparedGenerationRequest, PreparedLeg,
+    RequestError, RequestIds, TrtllmContextFirstContract, correlation_id_of,
+    decompose_disagg_request_id, parse_context_response, prepare_context_request,
+    prepare_generation_request,
 };
 
 use std::future::IntoFuture;

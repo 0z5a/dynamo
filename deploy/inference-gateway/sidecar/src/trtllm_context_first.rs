@@ -14,8 +14,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use bytes::Bytes;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// Upstream release these field semantics were read from.
 pub const VERIFIED_ENGINE_TAG: &str = "v1.3.0rc24";
@@ -653,6 +657,334 @@ impl TrtllmContextFirstContract {
     }
 }
 
+// ── Dispatch (A4-C3) ─────────────────────────────────────────────────────────
+
+/// Which leg a failure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leg {
+    Context,
+    Generation,
+}
+
+impl Leg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Generation => "generation",
+        }
+    }
+}
+
+impl std::fmt::Display for Leg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Why a leg did not produce a usable response.
+///
+/// These stay distinct on purpose: collapsing a connect failure, a read stall,
+/// a total deadline and an oversized body into one "timeout" would make a
+/// misconfigured endpoint indistinguishable from a slow engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LegFailure {
+    #[error("could not connect to the {leg} worker")]
+    Connect { leg: Leg },
+    #[error("the {leg} worker stopped sending data before finishing")]
+    ReadStall { leg: Leg },
+    #[error("the {leg} leg exceeded its total deadline")]
+    Deadline { leg: Leg },
+    #[error("the {leg} worker returned HTTP {status}")]
+    Status { leg: Leg, status: u16 },
+    #[error("the {leg} response body exceeded the configured limit of {limit} bytes")]
+    BodyTooLarge { leg: Leg, limit: usize },
+    #[error("the {leg} worker could not be reached")]
+    Unavailable { leg: Leg },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error(transparent)]
+    Request(#[from] RequestError),
+    #[error(transparent)]
+    Leg(#[from] LegFailure),
+    #[error("context handoff rejected: {source}")]
+    Handoff { source: HandoffError },
+    #[error("the client cancelled the request during the {leg} leg")]
+    Cancelled { leg: Leg },
+}
+
+impl From<HandoffError> for DispatchError {
+    fn from(source: HandoffError) -> Self {
+        Self::Handoff { source }
+    }
+}
+
+/// A response body owned until dropped, so cancelling the request also tears
+/// the stream down instead of orphaning it.
+#[derive(Debug)]
+pub struct OwnedBody {
+    bytes: Vec<u8>,
+    cancellation: CancellationToken,
+}
+
+impl OwnedBody {
+    pub fn new(bytes: Vec<u8>, cancellation: CancellationToken) -> Self {
+        Self {
+            bytes,
+            cancellation,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// The token that tears the stream down when this body is dropped.
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
+/// How one leg is executed. Behind a trait so ordering, error taxonomy and
+/// cancellation are testable with no network and no engine.
+#[async_trait::async_trait]
+pub trait LegTransport: Send + Sync {
+    /// Sends the context leg and returns the raw response body.
+    async fn send_context(
+        &self,
+        leg: PreparedLeg,
+        cancellation: CancellationToken,
+        deadline: Duration,
+    ) -> Result<Vec<u8>, LegFailure>;
+
+    /// Sends the generation leg. The returned body is owned by the caller.
+    async fn send_generation(
+        &self,
+        leg: PreparedLeg,
+        cancellation: CancellationToken,
+        deadline: Duration,
+    ) -> Result<OwnedBody, LegFailure>;
+}
+
+/// How a completed dispatch ended.
+#[derive(Debug)]
+pub enum DispatchOutcome {
+    /// The context leg produced the complete answer, so no generation ran.
+    /// A terminal success: not a failure, and not a gap.
+    ContextCompleted {
+        body: OwnedBody,
+        correlation_id: i64,
+    },
+    /// The generation leg ran; its body belongs to the response.
+    Generated {
+        body: OwnedBody,
+        correlation_id: i64,
+    },
+}
+
+impl DispatchOutcome {
+    pub fn body(&self) -> &OwnedBody {
+        match self {
+            Self::ContextCompleted { body, .. } | Self::Generated { body, .. } => body,
+        }
+    }
+
+    pub fn correlation_id(&self) -> i64 {
+        match self {
+            Self::ContextCompleted { correlation_id, .. }
+            | Self::Generated { correlation_id, .. } => *correlation_id,
+        }
+    }
+
+    /// True when no generation leg was sent.
+    pub fn context_completed(&self) -> bool {
+        matches!(self, Self::ContextCompleted { .. })
+    }
+}
+
+/// Per-leg budgets and body caps.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextFirstLimits {
+    /// Maximum accepted client request body.
+    pub request_body_bytes: usize,
+    /// Maximum accepted context response body. Separate from the request cap
+    /// because the handoff can be far larger than the request.
+    pub handoff_body_bytes: usize,
+    /// Total deadline for the context leg: bounds the whole leg, not one gap.
+    pub context_deadline: Duration,
+    /// Total deadline for the generation leg.
+    pub generation_deadline: Duration,
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum ConfigError {
+    #[error("request_body_bytes must be greater than zero")]
+    RequestBodyLimit,
+    #[error("handoff_body_bytes must be greater than zero")]
+    HandoffBodyLimit,
+    #[error("leg deadlines must be greater than zero")]
+    Deadline,
+}
+
+impl ContextFirstLimits {
+    pub fn new(
+        request_body_bytes: usize,
+        handoff_body_bytes: usize,
+        context_deadline: Duration,
+        generation_deadline: Duration,
+    ) -> Result<Self, ConfigError> {
+        if request_body_bytes == 0 {
+            return Err(ConfigError::RequestBodyLimit);
+        }
+        if handoff_body_bytes == 0 {
+            return Err(ConfigError::HandoffBodyLimit);
+        }
+        if context_deadline.is_zero() || generation_deadline.is_zero() {
+            return Err(ConfigError::Deadline);
+        }
+        Ok(Self {
+            request_body_bytes,
+            handoff_body_bytes,
+            context_deadline,
+            generation_deadline,
+        })
+    }
+}
+
+/// Runs the ordered context-first dispatch.
+pub struct ContextFirstDispatcher {
+    contract: TrtllmContextFirstContract,
+    transport: Arc<dyn LegTransport>,
+    ids: Arc<dyn RequestIds>,
+    limits: ContextFirstLimits,
+}
+
+impl ContextFirstDispatcher {
+    pub fn new(
+        contract: TrtllmContextFirstContract,
+        transport: Arc<dyn LegTransport>,
+        ids: Arc<dyn RequestIds>,
+        limits: ContextFirstLimits,
+    ) -> Self {
+        Self {
+            contract,
+            transport,
+            ids,
+            limits,
+        }
+    }
+
+    pub fn contract(&self) -> TrtllmContextFirstContract {
+        self.contract
+    }
+
+    pub fn limits(&self) -> ContextFirstLimits {
+        self.limits
+    }
+
+    /// Runs both legs in order for one client request.
+    ///
+    /// The context leg completes and its handoff validates before the
+    /// generation leg exists, so a context failure can never start generation.
+    /// Every failure before that point is therefore answerable with an HTTP
+    /// status; a failure during the generation leg happens after the response
+    /// has begun and cannot be.
+    pub async fn dispatch(
+        &self,
+        client_body: &[u8],
+        conversation_id: &str,
+        cancellation: CancellationToken,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if cancellation.is_cancelled() {
+            return Err(DispatchError::Cancelled { leg: Leg::Context });
+        }
+
+        let context = prepare_context_request(
+            client_body,
+            self.limits.request_body_bytes,
+            conversation_id,
+            self.ids.as_ref(),
+        )?;
+        let minted_id = context.leg.correlation_id;
+
+        let raw_context = self
+            .transport
+            .send_context(
+                context.leg,
+                cancellation.clone(),
+                self.limits.context_deadline,
+            )
+            .await?;
+
+        // The handoff cap is checked before parsing, so a hostile or broken
+        // worker cannot make the sidecar allocate without bound.
+        if raw_context.len() > self.limits.handoff_body_bytes {
+            return Err(LegFailure::BodyTooLarge {
+                leg: Leg::Context,
+                limit: self.limits.handoff_body_bytes,
+            }
+            .into());
+        }
+
+        let handoff = parse_context_response(&raw_context)?;
+        let resolved_id = handoff.disagg_request_id.unwrap_or(minted_id);
+
+        if !handoff.needs_generation() {
+            // The context leg produced the whole answer: no generation leg, and
+            // no added token.
+            return Ok(DispatchOutcome::ContextCompleted {
+                body: OwnedBody::new(raw_context, cancellation),
+                correlation_id: resolved_id,
+            });
+        }
+
+        let generation =
+            prepare_generation_request(client_body, &handoff, resolved_id, conversation_id)?;
+
+        if cancellation.is_cancelled() {
+            return Err(DispatchError::Cancelled {
+                leg: Leg::Generation,
+            });
+        }
+
+        let body = self
+            .transport
+            .send_generation(
+                generation.leg,
+                cancellation.clone(),
+                self.limits.generation_deadline,
+            )
+            .await?;
+
+        Ok(DispatchOutcome::Generated {
+            body,
+            correlation_id: resolved_id,
+        })
+    }
+}
+
+/// Reads the correlation id out of a serialized leg, so an operator can
+/// correlate both legs from a log line without parsing bodies by hand.
+pub fn correlation_id_of(body: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("disaggregated_params")?
+                .get("disagg_request_id")?
+                .as_i64()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,5 +1582,390 @@ mod tests {
         assert_eq!(contract.chat_completions_path(), CHAT_COMPLETIONS_PATH);
         assert!(contract.is_unsupported_request_type(REQUEST_TYPE_CONTEXT_AND_GENERATION));
         assert!(!contract.is_unsupported_request_type(REQUEST_TYPE_CONTEXT_ONLY));
+    }
+
+    // ── Dispatch (A4-C3) ─────────────────────────────────────────────────────
+
+    /// One recorded call, so tests can assert what was actually sent and in
+    /// what order rather than inferring it from the outcome.
+    #[derive(Debug, Clone)]
+    enum Sent {
+        Context(Vec<u8>),
+        Generation(Vec<u8>),
+    }
+
+    #[derive(Default)]
+    struct Scripted {
+        sent: std::sync::Mutex<Vec<Sent>>,
+        context: Option<Result<Vec<u8>, LegFailure>>,
+    }
+
+    impl Scripted {
+        fn returning_context(body: Vec<u8>) -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                context: Some(Ok(body)),
+            }
+        }
+
+        fn failing_context(failure: LegFailure) -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                context: Some(Err(failure)),
+            }
+        }
+
+        fn calls(&self) -> Vec<Sent> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn generation_calls(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| matches!(c, Sent::Generation(_)))
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LegTransport for Scripted {
+        async fn send_context(
+            &self,
+            leg: PreparedLeg,
+            _cancellation: CancellationToken,
+            _deadline: Duration,
+        ) -> Result<Vec<u8>, LegFailure> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push(Sent::Context(leg.body.to_vec()));
+            match &self.context {
+                Some(Ok(body)) => Ok(body.clone()),
+                Some(Err(failure)) => Err(*failure),
+                None => Err(LegFailure::Unavailable { leg: Leg::Context }),
+            }
+        }
+
+        async fn send_generation(
+            &self,
+            leg: PreparedLeg,
+            cancellation: CancellationToken,
+            _deadline: Duration,
+        ) -> Result<OwnedBody, LegFailure> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push(Sent::Generation(leg.body.to_vec()));
+            Ok(OwnedBody::new(
+                br#"{"object":"chat.completion","choices":[]}"#.to_vec(),
+                cancellation,
+            ))
+        }
+    }
+
+    fn limits() -> ContextFirstLimits {
+        ContextFirstLimits::new(
+            64 * 1024,
+            256 * 1024,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .expect("valid limits")
+    }
+
+    fn dispatcher(transport: Arc<Scripted>, minted: i64) -> ContextFirstDispatcher {
+        ContextFirstDispatcher::new(
+            TrtllmContextFirstContract::pinned(),
+            transport,
+            Arc::new(FixedIds(minted)),
+            limits(),
+        )
+    }
+
+    /// A context response body with an explicit `finish_reason`, so the
+    /// generation gate can be driven without re-serializing.
+    fn context_body(finish_reason: &str, params: Value, top: Value) -> Vec<u8> {
+        let mut parameters = json!({
+            "request_type": REQUEST_TYPE_CONTEXT_ONLY,
+            "ctx_request_id": 42,
+            "first_gen_tokens": [15043],
+        });
+        if let (Some(base), Some(extra)) = (parameters.as_object_mut(), params.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+
+        let mut body = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": finish_reason,
+                "disaggregated_params": parameters,
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        });
+        if let (Some(object), Some(extra)) = (body.as_object_mut(), top.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::to_vec(&body).expect("serializes")
+    }
+
+    fn request_body() -> Vec<u8> {
+        serde_json::to_vec(&client_request()).unwrap()
+    }
+
+    /// A4-R01: the generation leg is sent only after the context leg completed
+    /// and its handoff validated.
+    #[tokio::test]
+    async fn generation_runs_only_after_a_valid_context_handoff() {
+        let transport = Arc::new(Scripted::returning_context(context_body(
+            "length",
+            json!({}),
+            json!({"prompt_token_ids": [1, 2, 3]}),
+        )));
+        let outcome = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .expect("dispatch succeeds");
+
+        assert!(!outcome.context_completed());
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2, "both legs must run exactly once");
+        assert!(matches!(calls[0], Sent::Context(_)));
+        assert!(matches!(calls[1], Sent::Generation(_)));
+
+        // The context leg was non-streaming and carried the minted id.
+        let Sent::Context(ctx) = &calls[0] else {
+            unreachable!()
+        };
+        let ctx: Value = serde_json::from_slice(ctx).unwrap();
+        assert_eq!(ctx["stream"], json!(false));
+        assert_eq!(ctx["disaggregated_params"]["disagg_request_id"], 777);
+    }
+
+    /// A4-R02: both legs carry one correlation id, and the other context
+    /// identity is not overwritten by it.
+    #[tokio::test]
+    async fn both_legs_share_one_id_and_keep_ctx_request_id_distinct() {
+        let transport = Arc::new(Scripted::returning_context(context_body(
+            "length",
+            json!({}),
+            json!({"prompt_token_ids": [1]}),
+        )));
+        let outcome = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.correlation_id(), 777);
+
+        let calls = transport.calls();
+        let Sent::Generation(generation) = &calls[1] else {
+            unreachable!()
+        };
+        let generation: Value = serde_json::from_slice(generation).unwrap();
+        assert_eq!(generation["disaggregated_params"]["disagg_request_id"], 777);
+        assert_eq!(generation["disaggregated_params"]["ctx_request_id"], 42);
+    }
+
+    /// A4-R05: a context leg that already finished ends the request. No
+    /// generation leg is sent, and nothing is added.
+    #[tokio::test]
+    async fn a_finished_context_leg_runs_no_generation_and_returns_its_own_body() {
+        let transport = Arc::new(Scripted::returning_context(context_body(
+            "stop",
+            json!({}),
+            json!({"prompt_token_ids": [1]}),
+        )));
+        let outcome = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .expect("dispatch succeeds");
+
+        assert!(outcome.context_completed());
+        assert_eq!(transport.generation_calls(), 0);
+        assert!(!outcome.body().is_empty());
+    }
+
+    /// A4-R03/R09/R14: every pre-generation failure produces zero generation
+    /// requests and keeps its own classification.
+    #[tokio::test]
+    async fn no_failure_before_generation_can_start_it() {
+        // Unreachable worker.
+        let transport = Arc::new(Scripted::failing_context(LegFailure::Connect {
+            leg: Leg::Context,
+        }));
+        let error = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .expect_err("must fail");
+        assert!(matches!(
+            error,
+            DispatchError::Leg(LegFailure::Connect { leg: Leg::Context })
+        ));
+        assert_eq!(transport.generation_calls(), 0);
+
+        // Read stall, deadline and status stay distinguishable.
+        for failure in [
+            LegFailure::ReadStall { leg: Leg::Context },
+            LegFailure::Deadline { leg: Leg::Context },
+            LegFailure::Status {
+                leg: Leg::Context,
+                status: 503,
+            },
+        ] {
+            let transport = Arc::new(Scripted::failing_context(failure));
+            let error = dispatcher(transport.clone(), 777)
+                .dispatch(&request_body(), "conv-1", CancellationToken::new())
+                .await
+                .expect_err("must fail");
+            assert_eq!(error.to_string(), failure.to_string());
+            assert_eq!(transport.generation_calls(), 0);
+        }
+
+        // Malformed context body.
+        let transport = Arc::new(Scripted::returning_context(b"not json".to_vec()));
+        let error = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .expect_err("must fail");
+        assert!(matches!(error, DispatchError::Handoff { .. }));
+        assert_eq!(transport.generation_calls(), 0);
+
+        // Context response with no handoff at all.
+        let transport = Arc::new(Scripted::returning_context(
+            serde_json::to_vec(&json!({"choices": [{"index": 0}]})).unwrap(),
+        ));
+        let error = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .expect_err("must fail");
+        assert!(matches!(
+            error,
+            DispatchError::Handoff {
+                source: HandoffError::NoDisaggregatedParams
+            }
+        ));
+        assert_eq!(transport.generation_calls(), 0);
+    }
+
+    /// A4-R14: an oversized handoff body is rejected on size, before parsing.
+    #[tokio::test]
+    async fn an_oversized_handoff_is_rejected_by_size_not_by_parsing() {
+        let mut body = context_body("length", json!({}), json!({"prompt_token_ids": [1]}));
+        body.extend(std::iter::repeat_n(b' ', 512 * 1024));
+        let transport = Arc::new(Scripted::returning_context(body));
+        let error = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", CancellationToken::new())
+            .await
+            .expect_err("must fail");
+        match error {
+            DispatchError::Leg(LegFailure::BodyTooLarge { leg, limit }) => {
+                assert_eq!(leg, Leg::Context);
+                assert_eq!(limit, 256 * 1024);
+            }
+            other => panic!("expected a size rejection, got {other}"),
+        }
+        assert_eq!(transport.generation_calls(), 0);
+    }
+
+    /// A4-R11: cancelling while the context leg is in flight must not start the
+    /// generation leg.
+    #[tokio::test]
+    async fn cancellation_before_the_context_leg_starts_nothing() {
+        let transport = Arc::new(Scripted::returning_context(context_body(
+            "length",
+            json!({}),
+            json!({"prompt_token_ids": [1]}),
+        )));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = dispatcher(transport.clone(), 777)
+            .dispatch(&request_body(), "conv-1", cancellation)
+            .await
+            .expect_err("must fail");
+        assert!(matches!(
+            error,
+            DispatchError::Cancelled { leg: Leg::Context }
+        ));
+        assert!(transport.calls().is_empty(), "no leg may be sent");
+    }
+
+    /// A4-R16: a client cannot inject orchestration state into either leg.
+    #[tokio::test]
+    async fn client_supplied_orchestration_state_never_reaches_a_leg() {
+        let mut request = client_request();
+        request["disaggregated_params"] = json!({
+            "request_type": "generation_only",
+            "disagg_request_id": 1,
+        });
+        let transport = Arc::new(Scripted::returning_context(context_body(
+            "length",
+            json!({}),
+            json!({"prompt_token_ids": [1]}),
+        )));
+        let error = dispatcher(transport.clone(), 777)
+            .dispatch(
+                &serde_json::to_vec(&request).unwrap(),
+                "conv-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("must fail");
+        assert!(matches!(
+            error,
+            DispatchError::Request(RequestError::ForbiddenField { .. })
+        ));
+        assert!(transport.calls().is_empty());
+    }
+
+    /// A4-R18 control: the limits are validated at construction rather than
+    /// silently accepting a zero budget.
+    #[test]
+    fn limits_reject_zero_budgets() {
+        assert!(matches!(
+            ContextFirstLimits::new(0, 1, Duration::from_secs(1), Duration::from_secs(1)),
+            Err(ConfigError::RequestBodyLimit)
+        ));
+        assert!(matches!(
+            ContextFirstLimits::new(1, 0, Duration::from_secs(1), Duration::from_secs(1)),
+            Err(ConfigError::HandoffBodyLimit)
+        ));
+        assert!(matches!(
+            ContextFirstLimits::new(1, 1, Duration::ZERO, Duration::from_secs(1)),
+            Err(ConfigError::Deadline)
+        ));
+    }
+
+    /// The correlation id is readable from a serialized leg, for logging.
+    #[test]
+    fn correlation_id_is_readable_from_a_leg_body() {
+        let prepared = prepare_ctx(&client_request()).unwrap();
+        assert_eq!(correlation_id_of(&prepared.leg.body), Some(777));
+        assert_eq!(correlation_id_of(b"not json"), None);
+    }
+
+    /// The generation body is owned by the response, so the stream is bound to
+    /// the response's lifetime rather than the request's.
+    #[tokio::test]
+    async fn the_generation_body_carries_the_response_cancellation() {
+        let transport = Arc::new(Scripted::returning_context(context_body(
+            "length",
+            json!({}),
+            json!({"prompt_token_ids": [1]}),
+        )));
+        let cancellation = CancellationToken::new();
+        let outcome = dispatcher(transport, 777)
+            .dispatch(&request_body(), "conv-1", cancellation.clone())
+            .await
+            .unwrap();
+        assert!(!outcome.body().cancellation().is_cancelled());
+        cancellation.cancel();
+        assert!(outcome.body().cancellation().is_cancelled());
     }
 }
