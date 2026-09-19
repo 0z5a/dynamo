@@ -17,6 +17,8 @@ use std::time::Instant;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::Request;
 use bytes::Bytes;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -657,6 +659,37 @@ impl TrtllmContextFirstContract {
     }
 }
 
+/// Reads a client request body under an explicit byte cap.
+///
+/// The cap is enforced while reading, so an oversized or unfinished body cannot
+/// make the sidecar allocate without bound. A transport error is reported as a
+/// client error, because the client is the one that failed to deliver.
+pub async fn read_request_body(
+    request: Request<Body>,
+    limit: usize,
+) -> Result<Vec<u8>, RequestError> {
+    read_bounded_body(request.into_body(), limit)
+        .await
+        .map_err(|source| RequestError::MalformedJson { source })
+}
+
+/// Streams a body, rejecting it as soon as it exceeds `limit`.
+async fn read_bounded_body(body: Body, limit: usize) -> Result<Vec<u8>, serde_json::Error> {
+    let mut stream = body.into_data_stream();
+    let mut collected: Vec<u8> = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk
+            .map_err(|error| serde_json::Error::io(std::io::Error::other(error.to_string())))?;
+        if collected.len() + chunk.len() > limit {
+            return Err(serde_json::Error::io(std::io::Error::other(format!(
+                "body exceeds the configured limit of {limit} bytes"
+            ))));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected)
+}
+
 // ── Dispatch (A4-C3) ─────────────────────────────────────────────────────────
 
 /// Which leg a failure came from.
@@ -819,6 +852,9 @@ pub struct ContextFirstLimits {
     /// Maximum accepted context response body. Separate from the request cap
     /// because the handoff can be far larger than the request.
     pub handoff_body_bytes: usize,
+    /// Maximum accepted body for any leg response. Bounds what a broken or
+    /// hostile worker can make the sidecar hold.
+    pub response_body_bytes: usize,
     /// Total deadline for the context leg: bounds the whole leg, not one gap.
     pub context_deadline: Duration,
     /// Total deadline for the generation leg.
@@ -831,6 +867,8 @@ pub enum ConfigError {
     RequestBodyLimit,
     #[error("handoff_body_bytes must be greater than zero")]
     HandoffBodyLimit,
+    #[error("response_body_bytes must be greater than zero")]
+    ResponseBodyLimit,
     #[error("leg deadlines must be greater than zero")]
     Deadline,
 }
@@ -839,6 +877,7 @@ impl ContextFirstLimits {
     pub fn new(
         request_body_bytes: usize,
         handoff_body_bytes: usize,
+        response_body_bytes: usize,
         context_deadline: Duration,
         generation_deadline: Duration,
     ) -> Result<Self, ConfigError> {
@@ -848,12 +887,16 @@ impl ContextFirstLimits {
         if handoff_body_bytes == 0 {
             return Err(ConfigError::HandoffBodyLimit);
         }
+        if response_body_bytes == 0 {
+            return Err(ConfigError::ResponseBodyLimit);
+        }
         if context_deadline.is_zero() || generation_deadline.is_zero() {
             return Err(ConfigError::Deadline);
         }
         Ok(Self {
             request_body_bytes,
             handoff_body_bytes,
+            response_body_bytes,
             context_deadline,
             generation_deadline,
         })
@@ -866,6 +909,7 @@ pub struct ContextFirstDispatcher {
     transport: Arc<dyn LegTransport>,
     ids: Arc<dyn RequestIds>,
     limits: ContextFirstLimits,
+    conversations: AtomicU64,
 }
 
 impl ContextFirstDispatcher {
@@ -880,7 +924,16 @@ impl ContextFirstDispatcher {
             transport,
             ids,
             limits,
+            conversations: AtomicU64::new(0),
         }
+    }
+
+    /// Mints the gateway-owned conversation identity for one request.
+    ///
+    /// Uniqueness only has to hold within this process for the lifetime of a
+    /// request, which is what the pinned context leg uses it for.
+    pub fn next_conversation_sequence(&self) -> u64 {
+        self.conversations.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn contract(&self) -> TrtllmContextFirstContract {
@@ -1667,6 +1720,7 @@ mod tests {
         ContextFirstLimits::new(
             64 * 1024,
             256 * 1024,
+            512 * 1024,
             Duration::from_secs(30),
             Duration::from_secs(30),
         )
@@ -1929,15 +1983,15 @@ mod tests {
     #[test]
     fn limits_reject_zero_budgets() {
         assert!(matches!(
-            ContextFirstLimits::new(0, 1, Duration::from_secs(1), Duration::from_secs(1)),
+            ContextFirstLimits::new(0, 1, 1, Duration::from_secs(1), Duration::from_secs(1)),
             Err(ConfigError::RequestBodyLimit)
         ));
         assert!(matches!(
-            ContextFirstLimits::new(1, 0, Duration::from_secs(1), Duration::from_secs(1)),
+            ContextFirstLimits::new(1, 0, 1, Duration::from_secs(1), Duration::from_secs(1)),
             Err(ConfigError::HandoffBodyLimit)
         ));
         assert!(matches!(
-            ContextFirstLimits::new(1, 1, Duration::ZERO, Duration::from_secs(1)),
+            ContextFirstLimits::new(1, 1, 1, Duration::ZERO, Duration::from_secs(1)),
             Err(ConfigError::Deadline)
         ));
     }

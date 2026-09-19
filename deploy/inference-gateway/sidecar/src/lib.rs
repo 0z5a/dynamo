@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod config;
+mod context_first_adapter;
+mod context_first_transport;
 pub mod error;
 pub mod metadata;
 mod proxy;
 pub mod server;
 mod trtllm_context_first;
 
-pub use config::Config;
+pub use config::{AdapterMode, Config, ContextFirstConfig};
+pub use context_first_adapter::{ContextFirstAdapter, trtllm_context_first_adapter};
+pub use context_first_transport::ContextFirstTransport;
 pub use error::SidecarError;
 pub use metadata::{PREFILLER_HOST_PORT, PrefillEndpoint};
 pub use server::{PdAdapter, SidecarState, UnavailablePdAdapter, router};
