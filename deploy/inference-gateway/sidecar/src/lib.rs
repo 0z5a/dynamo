@@ -6,11 +6,17 @@ pub mod error;
 pub mod metadata;
 mod proxy;
 pub mod server;
+mod sglang_pd;
 
 pub use config::Config;
 pub use error::SidecarError;
 pub use metadata::{PREFILLER_HOST_PORT, PrefillEndpoint};
 pub use server::{PdAdapter, SidecarState, UnavailablePdAdapter, router};
+pub use sglang_pd::{
+    ContractError, PROTOCOL_REVISION, PreparedLeg, PreparedSglangRequests, RequestError,
+    RoomGenerator, SglangPdContract, TrustedBootstrap, enforce_body_limit, prepare_pd_requests,
+    prepare_pd_requests_with_random_room,
+};
 
 use std::future::IntoFuture;
 use std::sync::Arc;
