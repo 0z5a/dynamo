@@ -120,16 +120,21 @@ fn check_status(status: StatusCode, leg: Leg) -> Result<(), LegFailure> {
 async fn post_leg(
     client: &Client,
     url: Url,
-    leg_body: Vec<u8>,
+    prepared: &PreparedLeg,
     leg: Leg,
     cancellation: CancellationToken,
     deadline: Duration,
 ) -> Result<reqwest::Response, LegFailure> {
-    let request = client
+    let mut request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(leg_body)
-        .send();
+        .body(prepared.body.to_vec());
+    // The pinned worker rejects a protected handoff field without this header,
+    // so it is sent whenever the leg carries a signature.
+    if let Some((name, value)) = &prepared.auth_header {
+        request = request.header(*name, value);
+    }
+    let request = request.send();
     tokio::select! {
         () = cancellation.cancelled() => Err(LegFailure::Unavailable { leg }),
         result = tokio::time::timeout(deadline, request) => {
@@ -152,7 +157,7 @@ impl LegTransport for ContextFirstTransport {
         let response = post_leg(
             &self.client,
             url,
-            leg.body.to_vec(),
+            &leg,
             Leg::Context,
             cancellation,
             deadline,
@@ -172,7 +177,7 @@ impl LegTransport for ContextFirstTransport {
         let response = post_leg(
             &self.client,
             url,
-            leg.body.to_vec(),
+            &leg,
             Leg::Generation,
             cancellation.clone(),
             deadline,
@@ -267,6 +272,7 @@ mod tests {
             path: CHAT_COMPLETIONS_PATH,
             correlation_id: 1,
             body: bytes::Bytes::from_static(b"{}"),
+            auth_header: None,
         }
     }
 

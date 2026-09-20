@@ -42,6 +42,7 @@ fn build_adapter(config: &Config) -> anyhow::Result<Arc<dyn PdAdapter>> {
                 Arc::new(transport),
                 ids,
                 limits,
+                context_first.internal_auth_key.clone(),
             ));
             tracing::info!(
                 context_engine = %context_first.context_engine_url,
@@ -55,6 +56,7 @@ fn build_adapter(config: &Config) -> anyhow::Result<Arc<dyn PdAdapter>> {
                 generation_deadline_ms = limits.generation_deadline.as_millis(),
                 node_id = context_first.namespace.node_id(),
                 process_id = context_first.namespace.process_id(),
+                handoffs_signed = dispatcher.signs_handoffs(),
                 "TRT-LLM context-first adapter enabled"
             );
             Ok(Arc::new(trtllm_context_first_adapter(

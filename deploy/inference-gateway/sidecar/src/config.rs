@@ -19,6 +19,7 @@ const CONTEXT_FIRST_CONTEXT_DEADLINE_MS_ENV: &str = "DYN_CONTEXT_FIRST_CONTEXT_D
 const CONTEXT_FIRST_GENERATION_DEADLINE_MS_ENV: &str = "DYN_CONTEXT_FIRST_GENERATION_DEADLINE_MS";
 const CONTEXT_FIRST_NODE_ID_ENV: &str = "DYN_CONTEXT_FIRST_NODE_ID";
 const CONTEXT_FIRST_PROCESS_ID_ENV: &str = "DYN_CONTEXT_FIRST_PROCESS_ID";
+const INTERNAL_AUTH_KEY_ENV: &str = "DYN_CONTEXT_FIRST_INTERNAL_AUTH_KEY";
 const DECODE_ENGINE_PORT_ENV: &str = "DYN_DECODE_ENGINE_PORT";
 const CONNECT_TIMEOUT_MS_ENV: &str = "DYN_SIDECAR_CONNECT_TIMEOUT_MS";
 const READ_TIMEOUT_MS_ENV: &str = "DYN_SIDECAR_READ_TIMEOUT_MS";
@@ -78,6 +79,11 @@ pub struct ContextFirstConfig {
     /// rather than derived, because two gateways sharing one namespace would
     /// collide.
     pub namespace: DisaggIdNamespace,
+    /// Shared secret that signs the internal handoff. Required in practice:
+    /// the pinned generation worker rejects a request-supplied
+    /// `encoded_opaque_state` or `ctx_info_endpoint` when the handoff is
+    /// unsigned.
+    pub internal_auth_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,10 +166,23 @@ fn context_first_from_env(adapter_mode: AdapterMode) -> Result<Option<ContextFir
         u64_from_env(CONTEXT_FIRST_PROCESS_ID_ENV, 0)?,
     )
     .context("invalid context-first id namespace")?;
+    let internal_auth_key = match std::env::var_os(INTERNAL_AUTH_KEY_ENV) {
+        Some(raw) => {
+            let key = raw
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{INTERNAL_AUTH_KEY_ENV} must be valid UTF-8"))?;
+            if key.is_empty() {
+                bail!("{INTERNAL_AUTH_KEY_ENV} must be a non-empty string");
+            }
+            Some(key.into_bytes())
+        }
+        None => None,
+    };
     Ok(Some(ContextFirstConfig {
         context_engine_url,
         limits,
         namespace,
+        internal_auth_key,
     }))
 }
 
@@ -299,6 +318,7 @@ mod tests {
             context_engine_url: Url::parse("http://context:8000/").unwrap(),
             limits,
             namespace: DisaggIdNamespace::new(3, 4).unwrap(),
+            internal_auth_key: Some(b"shared".to_vec()),
         };
 
         // Every knob the operator can set is readable back off the config, so a
@@ -316,6 +336,9 @@ mod tests {
                 .as_str()
                 .starts_with("http://context")
         );
+        // Whether handoffs are signed must be visible, because an unsigned
+        // protected handoff is rejected by the worker.
+        assert_eq!(config.internal_auth_key.as_deref(), Some(&b"shared"[..]));
     }
 
     /// A zero response cap is refused as well, so no leg runs unbounded.

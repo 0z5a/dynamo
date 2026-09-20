@@ -14,6 +14,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -265,6 +267,8 @@ pub struct ContextHandoff {
     pub prompt_token_ids: Option<Vec<i64>>,
     /// base64 int32 buffer alternative to `prompt_token_ids`.
     pub prompt_token_ids_b64: Option<String>,
+    /// Protected field: the worker rejects it unless the request is signed.
+    pub ctx_info_endpoint: Option<String>,
 }
 
 impl ContextHandoff {
@@ -388,6 +392,7 @@ pub fn parse_context_response(body: &[u8]) -> Result<ContextHandoff, HandoffErro
         finish_reason: optional_string(choice, "finish_reason")?,
         prompt_token_ids: optional_i64_array(&parsed, "prompt_token_ids")?,
         prompt_token_ids_b64: optional_string(&parsed, "prompt_token_ids_b64")?,
+        ctx_info_endpoint: optional_string(params, "ctx_info_endpoint")?,
     };
     Ok(handoff)
 }
@@ -447,6 +452,8 @@ pub struct PreparedLeg {
     pub path: &'static str,
     pub correlation_id: i64,
     pub body: Bytes,
+    /// Header the leg must be sent with, when the protocol requires one.
+    pub auth_header: Option<(&'static str, String)>,
 }
 
 impl PreparedLeg {
@@ -536,6 +543,7 @@ pub fn prepare_context_request(
             path: CHAT_COMPLETIONS_PATH,
             correlation_id,
             body: Bytes::from(encoded),
+            auth_header: None,
         },
         conversation_id: conversation_id.to_string(),
     })
@@ -555,6 +563,7 @@ pub fn prepare_generation_request(
     handoff: &ContextHandoff,
     fallback_id: i64,
     conversation_id: &str,
+    auth_key: Option<&[u8]>,
 ) -> Result<PreparedGenerationRequest, RequestError> {
     let parsed: Value = serde_json::from_slice(client_body)
         .map_err(|source| RequestError::MalformedJson { source })?;
@@ -568,6 +577,7 @@ pub fn prepare_generation_request(
                 path: CHAT_COMPLETIONS_PATH,
                 correlation_id: fallback_id,
                 body: Bytes::new(),
+                auth_header: None,
             },
             correlation_id: None,
         });
@@ -627,6 +637,19 @@ pub fn prepare_generation_request(
     }
     object.insert("disaggregated_params".to_string(), Value::Object(params));
 
+    // A protected handoff field makes the signature mandatory: the generation
+    // worker rejects request-supplied `encoded_opaque_state` or
+    // `ctx_info_endpoint` when the internal handoff is unsigned.
+    let auth_header = auth_key
+        .and_then(|key| {
+            sign_disagg_handoff(
+                key,
+                handoff.encoded_opaque_state.as_deref(),
+                handoff.ctx_info_endpoint.as_deref(),
+            )
+        })
+        .map(|signature| (INTERNAL_DISAGG_AUTH_HEADER, signature));
+
     let encoded =
         serde_json::to_vec(&object).map_err(|source| RequestError::MalformedJson { source })?;
     Ok(PreparedGenerationRequest {
@@ -634,6 +657,7 @@ pub fn prepare_generation_request(
             path: CHAT_COMPLETIONS_PATH,
             correlation_id,
             body: Bytes::from(encoded),
+            auth_header,
         },
         correlation_id: Some(correlation_id),
     })
@@ -697,6 +721,63 @@ async fn read_bounded_body(body: Body, limit: usize) -> Result<Vec<u8>, serde_js
         collected.extend_from_slice(&chunk);
     }
     Ok(collected)
+}
+
+// ── Internal disaggregation authentication ───────────────────────────────────
+
+/// Header the generation worker expects for protected handoff fields.
+///
+/// Pinned source: `INTERNAL_DISAGG_AUTH_HEADER` in
+/// `tensorrt_llm/serve/disagg_auth.py`.
+pub const INTERNAL_DISAGG_AUTH_HEADER: &str = "x-trtllm-disagg-auth";
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Handoff fields the worker refuses unless the request is signed.
+///
+/// Pinned source: `_INTERNAL_DISAGG_AUTH_FIELDS`.
+pub const INTERNAL_DISAGG_AUTH_FIELDS: [&str; 2] = ["encoded_opaque_state", "ctx_info_endpoint"];
+
+/// Computes the signature the generation worker validates.
+///
+/// The pinned scheme is HMAC-SHA256 over
+/// `json.dumps({field: value}, sort_keys=True, separators=(",", ":"))` for the
+/// protected fields that are present, hex-encoded and prefixed with `sha256=`.
+/// `None` fields are included as JSON `null`, matching the producer, and
+/// `ctx_info_endpoint` is canonicalised from a list to its first element.
+///
+/// Returns `None` when the handoff carries no protected field, because the
+/// worker only requires a signature in that case.
+pub fn sign_disagg_handoff(
+    key: &[u8],
+    encoded_opaque_state: Option<&str>,
+    ctx_info_endpoint: Option<&str>,
+) -> Option<String> {
+    if encoded_opaque_state.is_none() && ctx_info_endpoint.is_none() {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "encoded_opaque_state": encoded_opaque_state,
+        "ctx_info_endpoint": ctx_info_endpoint,
+    });
+    // Sorted-key, compact separators: the two options the producer passes.
+    let canonical = serde_json::to_vec(&payload).ok()?;
+    let mut mac = HmacSha256::new_from_slice(key).ok()?;
+    mac.update(&canonical);
+    Some(format!(
+        "sha256={}",
+        hex_encode(&mac.finalize().into_bytes())
+    ))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
 }
 
 // ── Dispatch (A4-C3) ─────────────────────────────────────────────────────────
@@ -919,6 +1000,10 @@ pub struct ContextFirstDispatcher {
     ids: Arc<dyn RequestIds>,
     limits: ContextFirstLimits,
     conversations: AtomicU64,
+    /// Shared secret for the internal handoff signature. `None` means unsigned
+    /// handoffs, which the pinned worker only tolerates for a handoff that
+    /// carries no protected field.
+    internal_auth_key: Option<Vec<u8>>,
 }
 
 impl ContextFirstDispatcher {
@@ -927,6 +1012,7 @@ impl ContextFirstDispatcher {
         transport: Arc<dyn LegTransport>,
         ids: Arc<dyn RequestIds>,
         limits: ContextFirstLimits,
+        internal_auth_key: Option<Vec<u8>>,
     ) -> Self {
         Self {
             contract,
@@ -934,7 +1020,14 @@ impl ContextFirstDispatcher {
             ids,
             limits,
             conversations: AtomicU64::new(0),
+            internal_auth_key,
         }
+    }
+
+    /// Whether handoffs are signed. Logged at startup so an operator can see
+    /// that a protected handoff will be accepted.
+    pub fn signs_handoffs(&self) -> bool {
+        self.internal_auth_key.is_some()
     }
 
     /// Mints the gateway-owned conversation identity for one request.
@@ -1009,8 +1102,13 @@ impl ContextFirstDispatcher {
             });
         }
 
-        let generation =
-            prepare_generation_request(client_body, &handoff, resolved_id, conversation_id)?;
+        let generation = prepare_generation_request(
+            client_body,
+            &handoff,
+            resolved_id,
+            conversation_id,
+            self.internal_auth_key.as_deref(),
+        )?;
 
         if cancellation.is_cancelled() {
             return Err(DispatchError::Cancelled {
@@ -1444,6 +1542,7 @@ mod tests {
             &handoff,
             prepared.leg.correlation_id,
             &prepared.conversation_id,
+            None,
         )
         .expect("prepares");
         assert_eq!(generation.leg.field("stream"), Some(json!(false)));
@@ -1511,6 +1610,7 @@ mod tests {
             handoff,
             777,
             "conv-1",
+            None,
         )
         .expect("prepares");
         serde_json::from_slice(&prepared.leg.body).unwrap()
@@ -1528,6 +1628,7 @@ mod tests {
             finish_reason: Some("length".to_string()),
             prompt_token_ids: Some(vec![1, 2, 3]),
             prompt_token_ids_b64: None,
+            ctx_info_endpoint: None,
         };
         let body = generation_for(&handoff);
         let params = &body["disaggregated_params"];
@@ -1557,6 +1658,7 @@ mod tests {
             &handoff,
             777,
             "conv-1",
+            None,
         )
         .unwrap();
         assert_eq!(prepared.correlation_id, Some(4242));
@@ -1578,6 +1680,7 @@ mod tests {
                 &handoff,
                 777,
                 "conv-1",
+                None,
             )
             .expect("prepares");
             assert_eq!(
@@ -1639,6 +1742,7 @@ mod tests {
             &handoff,
             777,
             "conv-1",
+            None,
         )
         .expect_err("must be rejected");
         assert!(matches!(
@@ -1756,6 +1860,7 @@ mod tests {
             transport,
             Arc::new(FixedIds(minted)),
             limits(),
+            None,
         )
     }
 
@@ -2044,5 +2149,98 @@ mod tests {
         assert!(!outcome.body().cancellation().is_cancelled());
         cancellation.cancel();
         assert!(outcome.body().cancellation().is_cancelled());
+    }
+
+    // ── Internal handoff signature ───────────────────────────────────────────
+
+    /// The signature must match the pinned producer byte-for-byte, so it is
+    /// checked against an independently computed HMAC rather than a round trip
+    /// through our own code.
+    #[test]
+    fn the_handoff_signature_matches_an_independent_hmac() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let key = b"shared-secret";
+        let opaque = "opaque-blob";
+        let signature = sign_disagg_handoff(key, Some(opaque), None).expect("signed");
+        assert!(signature.starts_with("sha256="), "got {signature}");
+
+        // The producer canonicalises with sorted keys and compact separators,
+        // including nulls, so the payload is exactly this JSON.
+        let payload = br#"{"ctx_info_endpoint":null,"encoded_opaque_state":"opaque-blob"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(payload);
+        let expected = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+        assert_eq!(signature, format!("sha256={expected}"));
+    }
+
+    /// A handoff with no protected field needs no signature, because the worker
+    /// only demands one when such a field is present.
+    #[test]
+    fn an_unprotected_handoff_needs_no_signature() {
+        assert_eq!(sign_disagg_handoff(b"k", None, None), None);
+        assert!(sign_disagg_handoff(b"k", Some("state"), None).is_some());
+        assert!(sign_disagg_handoff(b"k", None, Some("host:1")).is_some());
+    }
+
+    /// Every protected field changes the signature, so a tampered value cannot
+    /// reuse another handoff's signature.
+    #[test]
+    fn changing_a_protected_field_changes_the_signature() {
+        let a = sign_disagg_handoff(b"k", Some("state-a"), None).unwrap();
+        let b = sign_disagg_handoff(b"k", Some("state-b"), None).unwrap();
+        let c = sign_disagg_handoff(b"k", Some("state-a"), Some("h:1")).unwrap();
+        assert_ne!(a, b, "a changed opaque state must change the signature");
+        assert_ne!(a, c, "a changed endpoint must change the signature");
+    }
+
+    /// The generation leg carries the header exactly when a protected field is
+    /// present and a key is configured.
+    #[test]
+    fn the_generation_leg_is_signed_only_when_it_needs_to_be() {
+        let signed = |handoff: &ContextHandoff, key: Option<&[u8]>| {
+            prepare_generation_request(
+                &serde_json::to_vec(&client_request()).unwrap(),
+                handoff,
+                1,
+                "conv-1",
+                key,
+            )
+            .expect("prepares")
+            .leg
+            .auth_header
+        };
+
+        let with_opaque = ContextHandoff {
+            finish_reason: Some("length".to_string()),
+            prompt_token_ids: Some(vec![1]),
+            encoded_opaque_state: Some("blob".to_string()),
+            ..Default::default()
+        };
+        let header = signed(&with_opaque, Some(b"k")).expect("must be signed");
+        assert_eq!(header.0, INTERNAL_DISAGG_AUTH_HEADER);
+        assert!(header.1.starts_with("sha256="));
+        // No key configured: unsigned, which the worker only tolerates for an
+        // unprotected handoff.
+        assert!(signed(&with_opaque, None).is_none());
+
+        let without_opaque = ContextHandoff {
+            finish_reason: Some("length".to_string()),
+            prompt_token_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        assert!(
+            signed(&without_opaque, Some(b"k")).is_none(),
+            "an unprotected handoff must not be signed"
+        );
     }
 }

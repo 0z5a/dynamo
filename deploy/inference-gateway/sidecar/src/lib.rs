@@ -18,11 +18,12 @@ pub use metadata::{PREFILLER_HOST_PORT, PrefillEndpoint};
 pub use server::{PdAdapter, SidecarState, UnavailablePdAdapter, router};
 pub use trtllm_context_first::{
     ContextFirstDispatcher, ContextFirstLimits, ContextHandoff, DisaggIdNamespace,
-    DisaggRequestIds, DispatchError, DispatchOutcome, HandoffError, Leg, LegFailure, LegTransport,
-    OwnedBody, PROTOCOL_REVISION, PreparedContextRequest, PreparedGenerationRequest, PreparedLeg,
-    RequestError, RequestIds, TrtllmContextFirstContract, correlation_id_of,
-    decompose_disagg_request_id, parse_context_response, prepare_context_request,
-    prepare_generation_request,
+    DisaggRequestIds, DispatchError, DispatchOutcome, HandoffError, INTERNAL_DISAGG_AUTH_FIELDS,
+    INTERNAL_DISAGG_AUTH_HEADER, Leg, LegFailure, LegTransport, OwnedBody, PROTOCOL_REVISION,
+    PreparedContextRequest, PreparedGenerationRequest, PreparedLeg, RequestError, RequestIds,
+    TrtllmContextFirstContract, correlation_id_of, decompose_disagg_request_id,
+    parse_context_response, prepare_context_request, prepare_generation_request, read_request_body,
+    sign_disagg_handoff,
 };
 
 use std::future::IntoFuture;
