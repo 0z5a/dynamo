@@ -87,6 +87,12 @@ is not reported as a slow engine:
 | `trtllm_context_handoff_invalid` | 502 | The context response carried no usable handoff |
 | `client_body_deadline_exceeded` | 408 | The client did not finish sending its body |
 | `invalid_request` | 400 | The client body was rejected before any leg ran |
+| `streaming_not_supported` | 501 | The request asked for a streaming response |
+
+**Streaming is not supported.** The context-first adapter buffers the generation
+leg and returns one JSON body, so a streaming request is refused with
+`501 Not Implemented` rather than answered with a body an SSE parser cannot read.
+The context leg is always non-streaming in any case.
 
 Every failure above the generation leg is a pre-response failure and is
 answerable with a status; a transport failure during the generation leg is not,

@@ -417,6 +417,8 @@ pub enum RequestError {
     NotAnObject,
     #[error("client-supplied {field} is not allowed; the gateway owns orchestration state")]
     ForbiddenField { field: &'static str },
+    #[error("streaming responses are not supported by the context-first adapter")]
+    UnsupportedStreaming,
     #[error("handoff rejected: {source}")]
     Handoff { source: HandoffError },
 }
@@ -507,6 +509,13 @@ pub fn prepare_context_request(
         return Err(RequestError::NotAnObject);
     };
     reject_client_orchestration(&object)?;
+
+    // Rejected rather than silently downgraded: the adapter buffers the
+    // generation leg and returns one JSON body, so answering a streaming
+    // request with it would hand the client a body its SSE parser cannot read.
+    if object.get("stream") == Some(&Value::Bool(true)) {
+        return Err(RequestError::UnsupportedStreaming);
+    }
 
     let correlation_id = ids.mint();
     object.insert("stream".to_string(), Value::Bool(false));
@@ -1389,7 +1398,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 32,
             "temperature": 0.25,
-            "stream": true,
+            "stream": false,
         })
     }
 
@@ -1415,12 +1424,16 @@ mod tests {
         assert_eq!(params["conversation_id"], "conv-1");
     }
 
-    /// A4-R08: forcing the context leg non-streaming must not change what the
-    /// client asked for on the generation leg.
+    /// A4-R08: the context leg is forced non-streaming while a non-streaming
+    /// client request keeps its mode on the generation leg.
     #[test]
-    fn the_client_streaming_mode_survives_to_the_generation_leg() {
-        let request = client_request();
+    fn a_non_streaming_client_request_keeps_its_mode_on_the_generation_leg() {
+        let mut request = client_request();
+        request["stream"] = json!(false);
         let prepared = prepare_ctx(&request).unwrap();
+        // The context leg is non-streaming regardless of what the client asked.
+        assert_eq!(prepared.leg.field("stream"), Some(json!(false)));
+
         let handoff = ContextHandoff {
             finish_reason: Some("length".to_string()),
             prompt_token_ids: Some(vec![1, 2, 3]),
@@ -1433,7 +1446,17 @@ mod tests {
             &prepared.conversation_id,
         )
         .expect("prepares");
-        assert_eq!(generation.leg.field("stream"), Some(json!(true)));
+        assert_eq!(generation.leg.field("stream"), Some(json!(false)));
+    }
+
+    /// A streaming request is refused before any leg runs, because the adapter
+    /// buffers the generation leg and cannot produce an SSE body.
+    #[test]
+    fn a_streaming_request_is_refused_rather_than_downgraded() {
+        let mut request = client_request();
+        request["stream"] = json!(true);
+        let error = prepare_ctx(&request).expect_err("must be refused");
+        assert!(matches!(error, RequestError::UnsupportedStreaming));
     }
 
     /// A4-R16: a client must not be able to inject orchestration state.

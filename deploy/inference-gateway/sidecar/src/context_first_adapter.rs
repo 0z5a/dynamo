@@ -77,6 +77,12 @@ fn map_request_error(error: &RequestError) -> SidecarError {
             "invalid_request",
             error.to_string(),
         ),
+        RequestError::UnsupportedStreaming => SidecarError::adapter(
+            StatusCode::NOT_IMPLEMENTED,
+            "streaming_not_supported",
+            "the context-first adapter buffers the generation leg and cannot ".to_string()
+                + "answer a streaming request; resend with stream=false",
+        ),
         RequestError::Handoff { source } => SidecarError::adapter(
             StatusCode::BAD_GATEWAY,
             "trtllm_context_handoff_invalid",

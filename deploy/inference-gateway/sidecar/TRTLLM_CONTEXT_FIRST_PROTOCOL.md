@@ -255,6 +255,19 @@ prefill rewrite**. The adapter must not invent one.
 (`openai_protocol.py:206`). Any adapter written against the newer development
 line, which lacks this field, would omit it here.
 
+## 8.2 Streaming is not implemented
+
+The pinned context leg is always non-streaming, and this adapter also buffers the
+generation leg: it reads the response body under a cap and returns a single JSON
+response. A client requesting `stream: true` therefore cannot be served
+correctly, so the adapter **refuses** such a request with `501 Not Implemented`
+rather than returning a non-SSE body that the client's parser cannot read.
+
+This was found by reviewing the code against its own tests: the request fixture
+used `stream: true` while the adapter returned buffered JSON, so the test was
+pinning a mode the adapter could not honour. Streaming generation is separate
+work, not an oversight to be papered over.
+
 ## 9. Open items and deployment preconditions
 
 Not established here; each is required before the adapter can be enabled.
