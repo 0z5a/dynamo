@@ -89,6 +89,8 @@ navigation:
         contents:
           - page: Install Dynamo
             path: ../pages-dev/kubernetes/installation/install-dynamo.md
+          - page: Install with AICR
+            path: ../pages-dev/kubernetes/installation/install-with-aicr.md
           - page: Multinode Orchestration
             path: ../pages-dev/kubernetes/installation/multinode-orchestration.md
           - page: Gateway API Inference Extension
@@ -132,6 +134,14 @@ navigation:
                 contents:
                   - page: GKE Setup
                     path: ../pages-dev/kubernetes/installation/managed-kubernetes/gcp/gke-setup.mdx
+      - section: Agent Sandboxes
+        icon: cube
+        collapsed: true
+        contents:
+          - page: Install Substrate
+            path: ../pages-dev/kubernetes/agent-sandboxes/install-substrate.mdx
+          - page: Monitor Substrate
+            path: ../pages-dev/kubernetes/agent-sandboxes/monitor-substrate.mdx
       # ==================== Usage ====================
       - section: Model Deployment
         icon: microchip
@@ -139,8 +149,6 @@ navigation:
         contents:
           - page: Introduction
             path: ../pages-dev/kubernetes/model-deployment/introduction.mdx
-          - page: Sidecar Backends (Experimental)
-            path: ../pages-dev/kubernetes/model-deployment/sidecar-backends.md
           - page: Deploy with DGD
             path: ../pages-dev/kubernetes/model-deployment/deploy-with-dgd.md
           - page: Expose the Frontend
@@ -152,6 +160,8 @@ navigation:
             contents:
               - page: Fast Model Loading
                 path: ../pages-dev/kubernetes/model-deployment/model-loading/fast-model-loading.mdx
+              - page: Dynamo Snapshot (Experimental)
+                path: ../pages-dev/kubernetes/model-deployment/model-loading/snapshot.mdx
               - page: MatrixHub
                 path: ../pages-dev/kubernetes/model-deployment/model-loading/matrixhub.md
       - section: KV-Aware Routing
@@ -162,8 +172,10 @@ navigation:
             path: ../pages-dev/kubernetes/kv-aware-routing/overview.md
           - page: Using the Dynamo Frontend
             path: ../pages-dev/kubernetes/kv-aware-routing/dynamo-frontend.md
-          - page: Deploy the DC KV Relay (Experimental)
-            path: ../pages-dev/kubernetes/kv-aware-routing/kv-dc-relay.md
+          - page: Deploy the Pool Relay (Experimental)
+            path: ../pages-dev/kubernetes/kv-aware-routing/pool-relay.md
+          - page: Global Discovery Service Storage (Experimental)
+            path: ../pages-dev/kubernetes/kv-aware-routing/global-discovery-service-storage.md
           - page: Using GAIE with Dynamo
             path: ../pages-dev/kubernetes/kv-aware-routing/gateway-api.mdx
           - page: Using GAIE with vanilla vLLM
@@ -196,6 +208,8 @@ navigation:
             path: ../pages-dev/kubernetes/fault-tolerance/request-migration.md
           - page: Request Rejection
             path: ../pages-dev/kubernetes/fault-tolerance/request-rejection.md
+          - page: Admission Control
+            path: ../pages-dev/kubernetes/fault-tolerance/admission-control.md
           - page: Graceful Shutdown
             path: ../pages-dev/kubernetes/fault-tolerance/graceful-shutdown.md
       - section: Auto Deployment
@@ -211,12 +225,16 @@ navigation:
             path: ../pages-dev/kubernetes/auto-deployment/dynamo-profiler.md
           - page: Dynamo Planner
             path: ../pages-dev/kubernetes/auto-deployment/dynamo-planner.mdx
+          - page: Planner Live Retune
+            path: ../pages-dev/kubernetes/auto-deployment/planner-live-retune.md
       - section: Operations
         icon: screwdriver-wrench
         collapsed: open-by-default
         contents:
           - page: Observability
             path: ../pages-dev/kubernetes/operations/observability.mdx
+          - page: Nsight Operator Profiling
+            path: ../pages-dev/kubernetes/operations/nsight-operator-profiling.mdx
           - page: Benchmarking with AIPerf
             path: ../pages-dev/kubernetes/operations/benchmarking-with-aiperf.mdx
           - page: Performance Tuning
@@ -334,9 +352,8 @@ navigation:
                   - page: Simulate a Kubernetes Deployment
                     slug: kubernetes-mocker
                     path: ../pages-dev/kubernetes/operations/simulation-with-dynosim/mocker-live-simulation.mdx
-                  - page: Benchmark Planner Decisions
-                    slug: planner-replay
-                    path: ../pages-dev/kubernetes/operations/simulation-with-dynosim/dynosim-planner-replay.mdx
+                  - link: Simulate Planner Decisions (AISimulate)
+                    href: /dynamo/dev/knowledge-base/modular-components/planner/aisimulate-planner-replay
                   - section: AISimulate (Experimental)
                     slug: ai-simulate
                     collapsed: true
@@ -382,6 +399,8 @@ navigation:
                     path: ../pages-dev/developer-guide/knowledge-base/concepts/fault-tolerance/request-cancellation-architecture.md
                   - page: Request Rejection Architecture
                     path: ../pages-dev/developer-guide/knowledge-base/concepts/fault-tolerance/request-rejection-architecture.md
+                  - page: Admission Control Architecture
+                    path: ../pages-dev/developer-guide/knowledge-base/concepts/fault-tolerance/admission-control-architecture.md
                   - page: Graceful Shutdown Architecture
                     path: ../pages-dev/developer-guide/knowledge-base/concepts/fault-tolerance/graceful-shutdown-architecture.md
                   - page: Fault Tolerance Testing
@@ -397,6 +416,10 @@ navigation:
                 contents:
                   - page: Overview
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/frontend/overview.md
+                  - page: Protocol Field Handling
+                    path: ../pages-dev/developer-guide/knowledge-base/modular-components/frontend/protocol-field-handling.md
+                  - page: OpenAPI Request-Contract Comparison
+                    path: ../pages-dev/developer-guide/knowledge-base/modular-components/frontend/openapi-request-contract-comparison.md
                   - page: KServe gRPC Frontend
                     slug: kserve-grpc-frontend
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/frontend/frontend-guide.md
@@ -404,6 +427,22 @@ navigation:
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/frontend/python-route-extensions.md
                   - page: Tokenizer
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/frontend/tokenizer.md
+                  - section: Tool Calling & Reasoning
+                    collapsed: true
+                    slug: tool-calling
+                    contents:
+                      - page: Overview
+                        path: ../pages-dev/use-cases/tool-calling-and-reasoning/overview.mdx
+                      - page: Chat Processors
+                        path: ../pages-dev/use-cases/tool-calling-and-reasoning/chat-processors.mdx
+                      - page: Tool Call Parsing
+                        path: ../pages-dev/use-cases/tool-calling-and-reasoning/tool-call-parsing.mdx
+                      - page: Reasoning Parsing
+                        path: ../pages-dev/use-cases/tool-calling-and-reasoning/reasoning-parsing.mdx
+                      - page: Structural Tag
+                        path: ../pages-dev/use-cases/tool-calling-and-reasoning/structural-tag.md
+                      - page: Troubleshooting Tool Calls
+                        path: ../pages-dev/use-cases/tool-calling-and-reasoning/troubleshooting-tool-calls.md
               - section: Router
                 collapsed: true
                 contents:
@@ -447,7 +486,7 @@ navigation:
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/topology-aware-kv-transfer.md
                       - page: Offloading Support Matrix
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/offloading-support-matrix.md
-                      - page: DC KV Relay Concepts (Experimental)
+                      - page: Pool Relay Concepts (Experimental)
                         slug: multi-dc-kv-routing
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/multi-dc-kv-routing.md
                   - section: Standalone Services
@@ -467,6 +506,8 @@ navigation:
                       - page: Write Custom Routing Strategies
                         slug: write-custom-routing-strategies
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/custom-worker-selection.mdx
+                      - page: Write an Admission Control Plugin
+                        path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/custom-admission-control.md
                       - page: Router Examples
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/router-examples.md
                       - page: Router Testing
@@ -486,6 +527,9 @@ navigation:
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/planner/global-planner-guide.md
                   - page: Planner Examples
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/planner/planner-examples.md
+                  - page: Simulate Planner Decisions (AISimulate)
+                    slug: aisimulate-planner-replay
+                    path: ../pages-dev/developer-guide/knowledge-base/modular-components/planner/aisimulate-planner-replay.mdx
                   - page: Planner Design
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/planner/planner-design.md
               - section: Profiler
@@ -640,32 +684,43 @@ navigation:
                 path: ../pages-dev/developer-guide/additional-resources/speculative-decoding/overview.md
               - page: Speculative Decoding with vLLM
                 path: ../pages-dev/developer-guide/additional-resources/speculative-decoding/speculative-decoding-with-vllm.md
+              - page: Speculative Decoding with SGLang
+                path: ../pages-dev/developer-guide/additional-resources/speculative-decoding/speculative-decoding-with-sglang.md
   - tab: use-cases
     layout:
-      # ==================== Features ====================
+      - page: Overview
+        slug: use-cases
+        icon: compass
+        path: ../pages-dev/use-cases/overview.mdx
+      # ==================== Reinforcement Learning ====================
       - section: Reinforcement Learning
         collapsed: true
         icon: brain
         slug: reinforcement-learning
         contents:
           - page: Overview
-            path: ../pages-dev/use-cases/reinforcement-learning/overview.md
+            path: ../pages-dev/use-cases/reinforcement-learning/overview.mdx
           - page: KV-Aware Load Balancing
             path: ../pages-dev/use-cases/reinforcement-learning/routing.md
           - page: Rollout Weight Updates
             path: ../pages-dev/use-cases/reinforcement-learning/weight-updates.md
           - page: RL Profiling and Simulation
             path: ../pages-dev/use-cases/reinforcement-learning/operations-and-simulation.md
-          - page: verl Integration
-            path: ../pages-dev/use-cases/reinforcement-learning/verl.md
-          - page: NeMo RL Integration
-            path: ../pages-dev/use-cases/reinforcement-learning/nemo-rl.md
-          - page: Slime Integration
-            path: ../pages-dev/use-cases/reinforcement-learning/slime.md
-          - page: External Trainer Integration
-            path: ../pages-dev/use-cases/reinforcement-learning/implementation-guide.md
-          - page: RL Integration Reference
-            path: ../pages-dev/use-cases/reinforcement-learning/integration-reference.md
+          - section: RL Framework Integrations
+            skip-slug: true
+            collapsed: open-by-default
+            contents:
+              - page: verl Integration
+                path: ../pages-dev/use-cases/reinforcement-learning/verl.md
+              - page: NeMo RL Integration
+                path: ../pages-dev/use-cases/reinforcement-learning/nemo-rl.md
+              - page: Slime Integration
+                path: ../pages-dev/use-cases/reinforcement-learning/slime.md
+              - page: External Trainer Integration
+                path: ../pages-dev/use-cases/reinforcement-learning/implementation-guide.md
+              - page: RL Integration Reference
+                path: ../pages-dev/use-cases/reinforcement-learning/integration-reference.md
+      # ==================== Agents ====================
       - section: Agents
         collapsed: true
         icon: users
@@ -673,45 +728,94 @@ navigation:
         contents:
           - page: Overview
             path: ../pages-dev/use-cases/agents/overview.md
-          - page: Session IDs
-            path: ../pages-dev/use-cases/agents/session-ids.mdx
-          - page: Agent Hints
-            path: ../pages-dev/use-cases/agents/agent-hints.md
-          - page: Priority Scheduling
-            path: ../pages-dev/use-cases/agents/priority-scheduling.md
-          - page: Agent Harnesses
+          - page: Run an Agent on Dynamo
+            path: ../pages-dev/use-cases/agents/run-an-agent-on-dynamo.md
+          - page: Connect an Agent Harness
+            slug: agent-harnesses
             path: ../pages-dev/use-cases/agents/agent-harnesses.mdx
-          - page: Agent Tracing
+          - page: Identify Agent Sessions
+            path: ../pages-dev/use-cases/agents/session-ids.mdx
+          - page: Maintain Session Affinity
+            path: ../pages-dev/use-cases/agents/session-affinity.md
+          - page: Prioritize Requests
+            path: ../pages-dev/use-cases/agents/priority-scheduling.mdx
+          - page: Sandboxed Coding Agents
+            path: ../pages-dev/use-cases/agents/harbor-substrate.mdx
+          - page: Trace Sandboxed Agents
+            path: ../pages-dev/use-cases/agents/trace-sandboxed-agents.mdx
+          - page: Trace an Agent Run
+            slug: agent-tracing
             path: ../pages-dev/use-cases/agents/agent-tracing.md
-          - page: Agent Simulation
+          - page: Simulate an Agent Run
+            slug: agent-simulation
             path: ../pages-dev/use-cases/agents/agent-simulation.mdx
-          - page: ThunderAgent Program Scheduler
+          - section: Schedule Agents with ThunderAgent
+            collapsed: true
+            slug: thunder-agent-program-scheduler
             path: ../pages-dev/use-cases/agents/thunderagent-program-scheduler.md
-      - section: Multimodal Serving
+            contents:
+              - page: Run the ThunderAgent Python Router
+                slug: thunder-agent-python-router
+                path: ../pages-dev/use-cases/agents/thunderagent-python-router.md
+      # ==================== Image Understanding ====================
+      - section: Image Understanding
         collapsed: true
-        icon: photo-film
-        slug: multimodal
+        icon: eye
+        slug: image-understanding
         contents:
           - page: Overview
-            path: ../pages-dev/use-cases/multimodal-serving/overview.md
-          - page: Parallel Media Decoding
-            path: ../pages-dev/use-cases/multimodal-serving/parallel-media-decoding.md
+            path: ../pages-dev/use-cases/image-understanding/overview.md
+          - section: VLM Performance Optimization
+            collapsed: open-by-default
+            slug: vlm-performance-optimization
+            path: ../pages-dev/use-cases/image-understanding/vlm-performance-optimization.md
+            contents:
+              - page: Multimodal KV Routing
+                path: ../pages-dev/use-cases/image-understanding/vlm-performance-optimization/multimodal-kv-routing.md
+              - page: Frontend Media Decoding
+                path: ../pages-dev/use-cases/image-understanding/vlm-performance-optimization/frontend-media-decoding.md
+              - page: Shared Image Cache
+                path: ../pages-dev/use-cases/image-understanding/vlm-performance-optimization/shared-image-cache.md
+              - page: Embedding Cache
+                path: ../pages-dev/use-cases/image-understanding/vlm-performance-optimization/embedding-cache.md
+              - page: Encoder Disaggregation
+                path: ../pages-dev/use-cases/image-understanding/vlm-performance-optimization/encoder-disaggregation.md
           - page: Custom Vision Encoders
-            slug: custom-vision-encoders
-            path: ../pages-dev/use-cases/multimodal-serving/custom-vision-encoders.md
-          - page: Embedding Cache
-            path: ../pages-dev/use-cases/multimodal-serving/embedding-cache.md
-          - page: Multimodal KV Routing
-            slug: multimodal-kv-routing
-            path: ../pages-dev/use-cases/multimodal-serving/multimodal-kv-routing.md
-          - page: Encoder Disaggregation
-            path: ../pages-dev/use-cases/multimodal-serving/encoder-disaggregation.md
-          - page: Video Decode GPU Requirements
-            slug: video-decode-gpu-requirements
-            path: ../pages-dev/use-cases/multimodal-serving/video-decode-gpu-requirements.md
+            path: ../pages-dev/use-cases/image-understanding/custom-vision-encoders.md
           - page: Additional Media Decoders
             slug: additional-media-decoders
-            path: ../pages-dev/use-cases/multimodal-serving/additional-media-decoders.md
+            path: ../pages-dev/use-cases/image-understanding/additional-media-decoders.md
+      # ==================== Speech ====================
+      - section: Speech
+        collapsed: true
+        icon: microphone
+        slug: speech
+        contents:
+          - page: Voice Pipelines
+            path: ../pages-dev/use-cases/speech/voice-pipelines.md
+          - page: Speech to Text (STT)
+            slug: speech-to-text
+            path: ../pages-dev/use-cases/speech/speech-to-text.md
+          - page: Text to Speech (TTS)
+            slug: text-to-speech
+            path: ../pages-dev/use-cases/speech/text-to-speech.md
+          - page: Speech to Speech
+            slug: speech-to-speech
+            path: ../pages-dev/use-cases/speech/speech-to-speech.md
+      # ==================== Video Understanding ====================
+      - section: Video Understanding
+        collapsed: true
+        icon: film
+        slug: video-understanding
+        contents:
+          - page: Overview
+            path: ../pages-dev/use-cases/video-understanding/overview.md
+          - page: Exact Video KV Routing
+            path: ../pages-dev/use-cases/video-understanding/exact-video-kv-routing.md
+          - page: Video Decoding and GPU Requirements
+            slug: video-decoding
+            path: ../pages-dev/use-cases/video-understanding/video-decoding.md
+      # ==================== Diffusion ====================
       - section: Diffusion
         collapsed: true
         icon: wand-magic-sparkles
@@ -720,7 +824,7 @@ navigation:
           - page: Overview
             path: ../pages-dev/use-cases/diffusion/overview.md
           - section: Workflows
-            collapsed: true
+            collapsed: open-by-default
             skip-slug: true
             contents:
               - page: Text-to-Image
@@ -732,29 +836,15 @@ navigation:
               - page: Image-to-Video
                 slug: image-to-video
                 path: ../pages-dev/use-cases/diffusion/workflows/image-to-video.md
-              - page: Text-to-Audio
-                slug: text-to-audio
-                path: ../pages-dev/use-cases/diffusion/workflows/text-to-audio.md
               - page: Text-to-Text (LLM Diffusion)
                 slug: text-to-text
                 path: ../pages-dev/use-cases/diffusion/workflows/text-to-text-llm-diffusion.md
-      - section: Tool Calling & Reasoning
+      - section: GPU Sharing
         collapsed: true
-        icon: screwdriver-wrench
-        slug: parsing
-        contents:
-          - page: Overview
-            path: ../pages-dev/use-cases/tool-calling-and-reasoning/overview.mdx
-          - page: Chat Processors
-            path: ../pages-dev/use-cases/tool-calling-and-reasoning/chat-processors.mdx
-          - page: Tool Call Parsing
-            path: ../pages-dev/use-cases/tool-calling-and-reasoning/tool-call-parsing.mdx
-          - page: Structural Tag
-            path: ../pages-dev/use-cases/tool-calling-and-reasoning/structural-tag.md
-          - page: Reasoning Parsing
-            path: ../pages-dev/use-cases/tool-calling-and-reasoning/reasoning-parsing.md
-          - page: Troubleshooting Tool Calls
-            path: ../pages-dev/use-cases/tool-calling-and-reasoning/troubleshooting-tool-calls.md
+        icon: layer-group
+        slug: gpu-sharing
+        path: ../pages-dev/use-cases/gpu-sharing/overview.mdx
+        contents: []
   - tab: recipes
     layout:
       # ==================== Model Recipes ====================
@@ -765,81 +855,177 @@ navigation:
           - page: Overview
             path: ../pages-dev/recipes/model-recipes/overview.mdx
             slug: browse
-          - page: K-EXAONE 2.0
-            path: ../pages-dev/recipes/model-recipes/k-exaone-2.mdx
-            slug: k-exaone-2
-          - page: Gemma-4-31B
-            path: ../pages-dev/recipes/model-recipes/gemma-4-31b.mdx
-            slug: gemma-4-31b
-          - page: DeepSeek-V4.1-Flash
-            path: ../pages-dev/recipes/model-recipes/deepseek-v4-1-flash.mdx
-            slug: deepseek-v4-1-flash
-          - page: GLM-5.3-Flash
-            path: ../pages-dev/recipes/model-recipes/glm-5-3-flash.mdx
-            slug: glm-5-3-flash
-          - page: A.X-K2
-            path: ../pages-dev/recipes/model-recipes/ax-k2.mdx
-            slug: ax-k2
-          - page: Kimi-K3
-            path: ../pages-dev/recipes/model-recipes/kimi-k3.mdx
-            slug: kimi-k3
-          - page: Solar Open2 250B
-            path: ../pages-dev/recipes/model-recipes/solar-open2-250b.mdx
-            slug: solar-open2-250b
-          - page: Qwen3.8-Flash-Next
-            path: ../pages-dev/recipes/model-recipes/qwen-3-8-flash-next.mdx
-            slug: qwen-3-8-flash-next
-          - page: Qwen3.8-2.4T-A95B
-            path: ../pages-dev/recipes/model-recipes/qwen-3-8-2-4t-a95b-fp8.mdx
-            slug: qwen-3-8-2-4t-a95b-fp8
-          - page: GLM-5.3/5.2
-            path: ../pages-dev/recipes/model-recipes/glm-5-2.mdx
-            slug: glm-5-2
-          - page: Inkling NVFP4
-            path: ../pages-dev/recipes/model-recipes/inkling-nvfp4.mdx
-            slug: inkling
-          - page: Kimi-K2.6
-            path: ../pages-dev/recipes/model-recipes/kimi-k2-6.mdx
-            slug: kimi-k2-6
-          - page: Nemotron 3.5 Lightning
-            path: ../pages-dev/recipes/model-recipes/nemotron-3-5-lightning.mdx
-            slug: nemotron-3-5-lightning
-          - page: Nemotron 3 Ultra
-            path: ../pages-dev/recipes/model-recipes/nemotron-3-ultra.mdx
-            slug: nemotron-3-ultra
-          - page: Nemotron 3 Super
-            path: ../pages-dev/recipes/model-recipes/nemotron-3-super.mdx
-            slug: nemotron-3-super
-          - page: GLM-5 NVFP4
-            path: ../pages-dev/recipes/model-recipes/glm-5-nvfp4.mdx
-            slug: glm-5-nvfp4
-          - page: DeepSeek-V4-Pro
-            path: ../pages-dev/recipes/model-recipes/deepseek-v4-pro.mdx
-            slug: deepseek-v4-pro
-          - page: DeepSeek-V4-Pro-0813
-            path: ../pages-dev/recipes/model-recipes/deepseek-v4-pro-0813.mdx
-            slug: deepseek-v4-pro-0813
-          - page: DeepSeek-V4-Flash
-            path: ../pages-dev/recipes/model-recipes/deepseek-v4-flash.mdx
-            slug: deepseek-v4-flash
-          - page: GPT-OSS-120B
-            path: ../pages-dev/recipes/model-recipes/gpt-oss-120b.mdx
-            slug: gpt-oss-120b
-          - page: Qwen3-32B
-            path: ../pages-dev/recipes/model-recipes/qwen3-32b.mdx
-            slug: qwen3-32b
-          - page: Qwen3.5-122B-A10B
-            path: ../pages-dev/recipes/model-recipes/qwen3-5-122b.mdx
-            slug: qwen3-5-122b
-          - page: Qwen3-235B-A22B FP8
-            path: ../pages-dev/recipes/model-recipes/qwen3-235b-a22b-fp8.mdx
-            slug: qwen3-235b-a22b-fp8
-          - page: Qwen3-32B FP8
-            path: ../pages-dev/recipes/model-recipes/qwen3-32b-fp8.mdx
-            slug: qwen3-32b-fp8
-          - page: Qwen3.6-35B-A3B
-            path: ../pages-dev/recipes/model-recipes/qwen3-6-35b-a3b.mdx
-            slug: qwen3-6-35b-a3b
+          # Grouped by model provider; each group uses skip-slug so page URLs
+          # stay /recipes/<slug>. Edit the recipe catalog and providers.yaml
+          # under pages/recipes/_catalog/, not this list.
+          # recipe-nav:begin — generated by scripts/gen_recipe_nav.py, do not edit
+          - section: Z.ai
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: GLM-5.3-Flash
+                path: ../pages-dev/recipes/model-recipes/glm-5-3-flash.mdx
+                slug: glm-5-3-flash
+              - page: GLM-5.3/5.2
+                path: ../pages-dev/recipes/model-recipes/glm-5-2.mdx
+                slug: glm-5-2
+              - page: GLM-5 NVFP4
+                path: ../pages-dev/recipes/model-recipes/glm-5-nvfp4.mdx
+                slug: glm-5-nvfp4
+          - section: Moonshot AI
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Kimi-K3.1-Pro
+                path: ../pages-dev/recipes/model-recipes/kimi-k3-1-pro.mdx
+                slug: kimi-k3-1-pro
+              - page: Kimi-K3
+                path: ../pages-dev/recipes/model-recipes/kimi-k3.mdx
+                slug: kimi-k3
+              - page: Kimi-K2.6
+                path: ../pages-dev/recipes/model-recipes/kimi-k2-6.mdx
+                slug: kimi-k2-6
+          - section: DeepSeek
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: DeepSeek-V4.1-Flash
+                path: ../pages-dev/recipes/model-recipes/deepseek-v4-1-flash.mdx
+                slug: deepseek-v4-1-flash
+              - page: DeepSeek-V4-Pro
+                path: ../pages-dev/recipes/model-recipes/deepseek-v4-pro.mdx
+                slug: deepseek-v4-pro
+              - page: DeepSeek-V4-Pro-0813
+                path: ../pages-dev/recipes/model-recipes/deepseek-v4-pro-0813.mdx
+                slug: deepseek-v4-pro-0813
+              - page: DeepSeek-V4-Flash
+                path: ../pages-dev/recipes/model-recipes/deepseek-v4-flash.mdx
+                slug: deepseek-v4-flash
+          - section: Qwen
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Qwen3.8-Flash-Next
+                path: ../pages-dev/recipes/model-recipes/qwen-3-8-flash-next.mdx
+                slug: qwen-3-8-flash-next
+              - page: Qwen3.8-2.4T-A95B
+                path: ../pages-dev/recipes/model-recipes/qwen-3-8-2-4t-a95b-fp8.mdx
+                slug: qwen-3-8-2-4t-a95b-fp8
+              - page: Qwen3.6-35B-A3B
+                path: ../pages-dev/recipes/model-recipes/qwen3-6-35b-a3b.mdx
+                slug: qwen3-6-35b-a3b
+              - page: Qwen3.5-122B-A10B
+                path: ../pages-dev/recipes/model-recipes/qwen3-5-122b.mdx
+                slug: qwen3-5-122b
+              - page: Qwen3-235B-A22B FP8
+                path: ../pages-dev/recipes/model-recipes/qwen3-235b-a22b-fp8.mdx
+                slug: qwen3-235b-a22b-fp8
+              - page: Qwen3-32B
+                path: ../pages-dev/recipes/model-recipes/qwen3-32b.mdx
+                slug: qwen3-32b
+              - page: Qwen3-32B FP8
+                path: ../pages-dev/recipes/model-recipes/qwen3-32b-fp8.mdx
+                slug: qwen3-32b-fp8
+          - section: NVIDIA
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Nemotron 3.5 Super VL
+                path: ../pages-dev/recipes/model-recipes/nemotron-3-5-super-vl-120b-a12b.mdx
+                slug: nemotron-3-5-super-vl
+              - page: Nemotron 3.5 Lightning
+                path: ../pages-dev/recipes/model-recipes/nemotron-3-5-lightning.mdx
+                slug: nemotron-3-5-lightning
+              - page: Cosmos3 Nano Reasoner
+                path: ../pages-dev/recipes/model-recipes/cosmos3-nano-reasoner.mdx
+                slug: cosmos3-nano-reasoner
+              - page: Nemotron 3 Ultra
+                path: ../pages-dev/recipes/model-recipes/nemotron-3-ultra.mdx
+                slug: nemotron-3-ultra
+              - page: Nemotron 3 Super
+                path: ../pages-dev/recipes/model-recipes/nemotron-3-super.mdx
+                slug: nemotron-3-super
+          - section: Google
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Gemma-4-31B
+                path: ../pages-dev/recipes/model-recipes/gemma-4-31b.mdx
+                slug: gemma-4-31b
+          - section: Thinking Machines
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Inkling NVFP4
+                path: ../pages-dev/recipes/model-recipes/inkling-nvfp4.mdx
+                slug: inkling
+          - section: OpenAI
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: GPT-OSS-120B
+                path: ../pages-dev/recipes/model-recipes/gpt-oss-120b.mdx
+                slug: gpt-oss-120b
+          - section: LG AI Research
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: K-EXAONE 2.0
+                path: ../pages-dev/recipes/model-recipes/k-exaone-2.mdx
+                slug: k-exaone-2
+          - section: SK Telecom
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: A.X-K2
+                path: ../pages-dev/recipes/model-recipes/ax-k2.mdx
+                slug: ax-k2
+          - section: Upstage
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Solar Open2 250B
+                path: ../pages-dev/recipes/model-recipes/solar-open2-250b.mdx
+                slug: solar-open2-250b
+          - section: Meta
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Muse-Spark-Open-816B-A42B
+                path: ../pages-dev/recipes/model-recipes/Muse-Spark-Open.mdx
+                slug: Muse-Spark-Open
+          - section: MiniMax
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: MiniMax M3.1
+                path: ../pages-dev/recipes/model-recipes/minimax-m3-1.mdx
+                slug: minimax-m3-1
+              - page: MiniMax M3
+                path: ../pages-dev/recipes/model-recipes/minimax-m3.mdx
+                slug: minimax-m3
+          - section: Mistral AI
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Mistral Large 4
+                path: ../pages-dev/recipes/model-recipes/mistral-large-4.mdx
+                slug: mistral-large-4
+          - section: Motif Technologies
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Motif-3 NVFP4
+                path: ../pages-dev/recipes/model-recipes/motif-3.mdx
+                slug: motif-3
+          - section: Reflection
+            skip-slug: true
+            collapsed: true
+            contents:
+              - page: Beam-1.0-501B-A23B
+                path: ../pages-dev/recipes/model-recipes/beam-1-0-501b.mdx
+                slug: beam-1-0-501b
+                # recipe-nav:end
       # ==================== Kubernetes Templates ====================
       - section: Kubernetes Templates
         icon: fa-brands fa-kubernetes
@@ -847,12 +1033,12 @@ navigation:
           - section: DGD
             collapsed: open-by-default
             contents:
-              - page: vLLM
-                path: ../pages-dev/recipes/kubernetes-templates/dgd/vllm.mdx
-              - page: TensorRT-LLM
-                path: ../pages-dev/recipes/kubernetes-templates/dgd/tensorrt-llm.mdx
               - page: SGLang
                 path: ../pages-dev/recipes/kubernetes-templates/dgd/sglang.mdx
+              - page: TensorRT-LLM
+                path: ../pages-dev/recipes/kubernetes-templates/dgd/tensorrt-llm.mdx
+              - page: vLLM
+                path: ../pages-dev/recipes/kubernetes-templates/dgd/vllm.mdx
           - page: DGDR
             path: ../pages-dev/recipes/kubernetes-templates/dgdr.mdx
       # ==================== Local Templates ====================
@@ -860,12 +1046,12 @@ navigation:
         slug: cli-templates
         icon: rectangle-terminal
         contents:
-          - page: vLLM
-            path: ../pages-dev/recipes/cli-templates/vllm.mdx
-          - page: TensorRT-LLM
-            path: ../pages-dev/recipes/cli-templates/tensorrt-llm.mdx
           - page: SGLang
             path: ../pages-dev/recipes/cli-templates/sglang.mdx
+          - page: TensorRT-LLM
+            path: ../pages-dev/recipes/cli-templates/tensorrt-llm.mdx
+          - page: vLLM
+            path: ../pages-dev/recipes/cli-templates/vllm.mdx
       # ==================== Feature Benchmarks ====================
       # Evidence pages behind the recipes: controlled A/B benchmarks whose
       # winning configs promote into recipes. Kept adjacent to Recipes so the
@@ -946,6 +1132,12 @@ navigation:
         path: ../pages-dev/reference/general/releases/release-history.mdx
         collapsed: true
         contents:
+          - page: Dynamo v1.6.0
+            path: ../pages-dev/reference/general/releases/dynamo-v1-6-0.mdx
+            slug: v1-6-0
+          - page: Dynamo v1.5.0
+            path: ../pages-dev/reference/general/releases/dynamo-v1-5-0.mdx
+            slug: v1-5-0
           - page: Dynamo v1.4.0
             path: ../pages-dev/reference/general/releases/dynamo-v1-4-0.mdx
             slug: v1-4-0
@@ -1068,6 +1260,10 @@ navigation:
             contents:
               - page: API Reference (K8s)
                 path: ../pages-dev/reference/kubernetes-api/additional-resources/api-reference-k8s.md
+      - page: Image Edits API
+        icon: image
+        path: ../pages-dev/reference/api/image-edits.mdx
+        slug: api/image-edits
       - section: Components
         icon: sliders
         slug: components
@@ -1079,9 +1275,12 @@ navigation:
             path: ../pages-dev/reference/components/tls-configuration.mdx
           - page: Frontend Configuration
             path: ../pages-dev/reference/components/frontend-configuration.mdx
-          - page: Multi-Datacenter KV Relay Configuration
-            path: ../pages-dev/reference/components/kv-dc-relay-configuration.md
-            slug: dc-kv-relay-configuration
+          - page: Pool Relay Configuration
+            path: ../pages-dev/reference/components/pool-relay-configuration.md
+            slug: pool-relay-configuration
+          - page: Global Discovery Service Configuration
+            path: ../pages-dev/reference/components/global-discovery-service-configuration.md
+            slug: global-discovery-service-configuration
           - page: Planner Configuration
             path: ../pages-dev/reference/components/planner-configuration.mdx
           - page: Profiler Configuration
@@ -1163,7 +1362,7 @@ navigation:
             path: ../pages-dev/enterprise/overview.mdx
             slug: overview
           - page: Supported Artifacts
-            path: ../pages-dev/enterprise/supported-artifacts.mdx
+            path: ../pages-dev/reference/general/enterprise-supported-artifacts.mdx
             slug: supported-artifacts
           - page: Install
             path: ../pages-dev/enterprise/install.mdx
@@ -1200,6 +1399,12 @@ navigation:
         contents:
           # Keep this archive in reverse chronological order. Publication dates are
           # rendered in each article header and on the custom landing page.
+          - page: "AIPerf Benchmarking"
+            path: ../pages-dev/blog/2026/aiperf-benchmarking.mdx
+            slug: aiperf-benchmarking
+          - page: "When to use EPD Disaggregation for Multimodal Serving"
+            path: ../pages-dev/blog/2026/epd-disaggregation-multimodal.mdx
+            slug: epd-disaggregation-multimodal
           - page: "Dynamo Agent Optimization Skills"
             path: ../pages-dev/blog/2026/agent-optimization-skills.mdx
             slug: agent-optimization-skills
